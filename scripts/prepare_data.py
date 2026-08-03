@@ -18,7 +18,7 @@ import sys
 from typing import Any
 
 import datasets
-
+from PIL import Image
 
 REMOVE_HINT = (
     "Only focus on the objects inside the red bounding box in the image "
@@ -65,24 +65,33 @@ def clean_question(problem: str) -> str:
     return text.strip()
 
 
-def build_record(item: dict[str, Any], data_dir: str) -> dict[str, Any]:
+def build_record(item: dict[str, Any], data_dir: str, index: int) -> dict[str, Any]:
     image_rel = item["images"][0]
     teacher_rel = item["teacher_images"][0]
     image_path = os.path.join(data_dir, image_rel)
     teacher_path = os.path.join(data_dir, teacher_rel)
     question = clean_question(item.get("problem", ""))
+    bbox = item.get("bbox")
+    if bbox is None or len(bbox) != 4:
+        raise ValueError(f"Sample {index} is missing a valid bbox: {bbox!r}")
+    with Image.open(image_path) as image:
+        image_width, image_height = image.size
 
     return {
         "data_source": "zwz_rl_vqa_bbox_teacher",
         "prompt": [{"role": "user", "content": item["problem"]}],
         "images": [{"path": image_path}],
         "bbox_images": [{"path": teacher_path}],
+        "bbox": list(bbox),
+        "image_width": image_width,
+        "image_height": image_height,
         "ability": "visual_question_answering",
         "reward_model": {
             "style": "none",
             "ground_truth": item.get("answer", ""),
         },
         "extra_info": {
+            "index": index,
             "answer": item.get("answer", ""),
             "question": question,
             "source_extra_info": item.get("extra_info", {}),
@@ -99,9 +108,9 @@ def convert_to_parquet(data_dir: str) -> None:
     print("Converting train.jsonl to train.parquet ...")
     records = []
     with open(jsonl_path, encoding="utf-8") as f:
-        for line in f:
+        for index, line in enumerate(f):
             item = json.loads(line)
-            records.append(build_record(item, data_dir))
+            records.append(build_record(item, data_dir, index))
 
     dataset = datasets.Dataset.from_list(records)
     output_path = os.path.join(data_dir, "train.parquet")

@@ -67,6 +67,11 @@ class SelfDistillationConfig(BaseConfig):
         teacher_model_source (str): Teacher source. Options: "legacy", "current" or "fixed".
         teacher_model_path (Optional[str]): Fixed teacher model path when teacher_model_source="fixed".
         teacher_image_key (Optional[str]): Dataset column holding teacher-side images for multimodal distillation.
+        teacher_visual_token_mode (str): "crop" or "same_image_bbox_mask".
+        teacher_bbox_key (str): Dataset column holding source-image bounding boxes.
+        teacher_background_keep_ratio (float): Fraction of non-target merged image tokens kept by the teacher.
+        teacher_background_sampling (str): Deterministic background sampling strategy.
+        teacher_visual_token_seed (int): Seed mixed with the stable sample index for background selection.
         fallback_to_policy_loss_on_missing_teacher (bool): When teacher_always_on=True, fall back to vanilla
             policy loss for samples whose teacher_image_key column is empty.
         log_prob_dump_dir (Optional[str]): Optional directory used to dump student/teacher log-prob tensors for each step.
@@ -106,6 +111,11 @@ class SelfDistillationConfig(BaseConfig):
     teacher_model_source: str = "legacy"
     teacher_model_path: Optional[str] = None
     teacher_image_key: Optional[str] = None
+    teacher_visual_token_mode: str = "crop"
+    teacher_bbox_key: str = "bbox"
+    teacher_background_keep_ratio: float = 0.1
+    teacher_background_sampling: str = "fixed_stratified"
+    teacher_visual_token_seed: int = 0
     teacher_prompt_mode: Optional[str] = None
     answer_hint_template: str = (
         "\n\nHere is a reference solution to this problem:\n"
@@ -145,7 +155,35 @@ class SelfDistillationConfig(BaseConfig):
             raise ValueError(
                 f"self_distillation.teacher_prompt_mode must be None or 'answer_hint', got {self.teacher_prompt_mode}"
             )
-        if self.teacher_always_on and not self.teacher_image_key and self.teacher_prompt_mode != "answer_hint":
+        valid_visual_token_modes = ["crop", "same_image_bbox_mask"]
+        if self.teacher_visual_token_mode not in valid_visual_token_modes:
+            raise ValueError(
+                "self_distillation.teacher_visual_token_mode must be one of "
+                f"{valid_visual_token_modes}, got {self.teacher_visual_token_mode}"
+            )
+        if not 0.0 <= self.teacher_background_keep_ratio <= 1.0:
+            raise ValueError(
+                "self_distillation.teacher_background_keep_ratio must be in [0,1], "
+                f"got {self.teacher_background_keep_ratio}"
+            )
+        if self.teacher_background_sampling != "fixed_stratified":
+            raise ValueError(
+                "self_distillation.teacher_background_sampling must be 'fixed_stratified', "
+                f"got {self.teacher_background_sampling}"
+            )
+        sparse_same_image = self.teacher_visual_token_mode == "same_image_bbox_mask"
+        if sparse_same_image and not self.teacher_bbox_key:
+            raise ValueError("self_distillation.teacher_bbox_key is required for same_image_bbox_mask")
+        if sparse_same_image and self.teacher_prompt_mode is not None:
+            raise ValueError("same_image_bbox_mask cannot be combined with teacher_prompt_mode")
+        if sparse_same_image and self.fallback_to_policy_loss_on_missing_teacher:
+            raise ValueError("same_image_bbox_mask requires bbox metadata for every sample and cannot use fallback")
+        if (
+            self.teacher_always_on
+            and not sparse_same_image
+            and not self.teacher_image_key
+            and self.teacher_prompt_mode != "answer_hint"
+        ):
             raise ValueError(
                 "self_distillation.teacher_image_key is required when teacher_always_on=True "
                 "(unless teacher_prompt_mode='answer_hint')"

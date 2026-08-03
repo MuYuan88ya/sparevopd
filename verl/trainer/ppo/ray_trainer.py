@@ -70,6 +70,7 @@ from verl.utils.metric import reduce_metrics
 from verl.utils.py_functional import rename_dict
 from verl.utils.rollout_skip import RolloutSkip
 from verl.utils.seqlen_balancing import calculate_workload, get_seqlen_balanced_partitions, log_seqlen_unbalance
+from verl.utils.teacher_visual_token_mask import apply_image_token_keep_mask, build_bbox_sparse_keep_mask
 from verl.utils.torch_functional import masked_mean
 from verl.utils.torch_functional import postprocess_data
 from verl.utils.tracking import ValidationGenerationsLogger
@@ -657,6 +658,8 @@ class RayPPOTrainer:
             return False
         if self_distillation_cfg.get("fallback_to_policy_loss_on_missing_teacher", False):
             return False
+        if self_distillation_cfg.get("teacher_visual_token_mode", "crop") == "same_image_bbox_mask":
+            return True
         if self_distillation_cfg.get("teacher_image_key", None) is not None:
             return True
         if self_distillation_cfg.get("teacher_prompt_mode", None) == "answer_hint":
@@ -1133,6 +1136,141 @@ class RayPPOTrainer:
             solution_str = self._remove_thinking_trace(solution_str)
         return solution_str
 
+    def _build_same_image_sparse_teacher_batch(
+        self,
+        batch: DataProto,
+        self_distillation_cfg: Any,
+    ) -> tuple[DataProto, dict[str, float]]:
+        if not self.config.actor_rollout_ref.model.get("use_remove_padding", False):
+            raise ValueError("same_image_bbox_mask requires actor_rollout_ref.model.use_remove_padding=True")
+        if self.processor is None:
+            raise ValueError("same_image_bbox_mask requires a multimodal processor")
+
+        model_type = getattr(getattr(self.processor, "config", None), "model_type", None)
+        if model_type not in {"qwen3_5", "qwen3_5_moe"}:
+            raise ValueError(f"same_image_bbox_mask currently supports Qwen3.5 only, got {model_type!r}")
+
+        bbox_key = self_distillation_cfg.get("teacher_bbox_key", "bbox")
+        required_non_tensor_keys = {bbox_key, "image_width", "image_height", "multi_modal_inputs", "index"}
+        missing_keys = required_non_tensor_keys - set(batch.non_tensor_batch.keys())
+        if missing_keys:
+            raise KeyError(f"same_image_bbox_mask is missing batch fields: {sorted(missing_keys)}")
+
+        input_ids = batch.batch["input_ids"]
+        attention_mask = batch.batch["attention_mask"]
+        responses = batch.batch["responses"]
+        batch_size = input_ids.shape[0]
+        prompt_length = input_ids.shape[1] - responses.shape[1]
+        if prompt_length < 1:
+            raise ValueError(
+                f"Invalid prompt length {prompt_length} from input length {input_ids.shape[1]} "
+                f"and response length {responses.shape[1]}"
+            )
+
+        image_token_id = int(self.processor.image_token_id)
+        merge_size = int(self.processor.image_processor.merge_size)
+        background_keep_ratio = float(self_distillation_cfg.get("teacher_background_keep_ratio", 0.1))
+        background_sampling = self_distillation_cfg.get("teacher_background_sampling", "fixed_stratified")
+        if background_sampling != "fixed_stratified":
+            raise ValueError(
+                "same_image_bbox_mask requires teacher_background_sampling='fixed_stratified', "
+                f"got {background_sampling!r}"
+            )
+        seed = int(self_distillation_cfg.get("teacher_visual_token_seed", 0))
+
+        teacher_attention_mask = attention_mask.clone()
+        teacher_multi_modal_inputs = []
+        target_token_count = 0
+        background_token_count = 0
+        kept_background_token_count = 0
+
+        for sample_idx in range(batch_size):
+            self._raise_if_response_contains_visual_special_tokens(
+                responses[sample_idx],
+                batch.batch["response_mask"][sample_idx],
+                batch,
+                sample_idx,
+            )
+            multi_modal_inputs = batch.non_tensor_batch["multi_modal_inputs"][sample_idx]
+            multi_modal_inputs = getattr(multi_modal_inputs, "data", multi_modal_inputs)
+            if not isinstance(multi_modal_inputs, dict):
+                raise TypeError(
+                    f"multi_modal_inputs must be a dict for sample {sample_idx}, got {type(multi_modal_inputs)}"
+                )
+            image_grid_thw = multi_modal_inputs.get("image_grid_thw")
+            if image_grid_thw is None or image_grid_thw.ndim != 2 or image_grid_thw.shape != (1, 3):
+                shape = None if image_grid_thw is None else tuple(image_grid_thw.shape)
+                raise ValueError(
+                    "same_image_bbox_mask supports exactly one image per sample; "
+                    f"sample {sample_idx} has image_grid_thw={shape}"
+                )
+
+            grid_t, patch_grid_height, patch_grid_width = (int(value) for value in image_grid_thw[0].tolist())
+            if grid_t != 1:
+                raise ValueError(f"same_image_bbox_mask supports still images only, got grid_t={grid_t}")
+            if patch_grid_height % merge_size or patch_grid_width % merge_size:
+                raise ValueError(
+                    f"image grid {(patch_grid_height, patch_grid_width)} is not divisible by merge size {merge_size}"
+                )
+
+            selection = build_bbox_sparse_keep_mask(
+                bbox=batch.non_tensor_batch[bbox_key][sample_idx],
+                image_width=int(batch.non_tensor_batch["image_width"][sample_idx]),
+                image_height=int(batch.non_tensor_batch["image_height"][sample_idx]),
+                grid_height=patch_grid_height // merge_size,
+                grid_width=patch_grid_width // merge_size,
+                background_keep_ratio=background_keep_ratio,
+                sample_id=batch.non_tensor_batch["index"][sample_idx],
+                seed=seed,
+            )
+            teacher_attention_mask[sample_idx] = apply_image_token_keep_mask(
+                input_ids=input_ids[sample_idx],
+                attention_mask=attention_mask[sample_idx],
+                image_token_id=image_token_id,
+                image_token_keep_mask=selection.keep_mask,
+            )
+            if not torch.equal(
+                teacher_attention_mask[sample_idx, prompt_length:],
+                attention_mask[sample_idx, prompt_length:],
+            ):
+                raise RuntimeError(f"Sparse teacher masking modified response tokens for sample {sample_idx}")
+
+            sparse_multi_modal_inputs = dict(multi_modal_inputs)
+            sparse_multi_modal_inputs["image_token_keep_mask"] = selection.keep_mask
+            teacher_multi_modal_inputs.append(sparse_multi_modal_inputs)
+            target_token_count += selection.target_token_count
+            background_token_count += selection.background_token_count
+            kept_background_token_count += selection.kept_background_token_count
+
+        total_visual_tokens = target_token_count + background_token_count
+        kept_visual_tokens = target_token_count + kept_background_token_count
+        teacher_llm_effective_tokens = int(teacher_attention_mask.sum().item())
+        device = input_ids.device
+        teacher_present_mask = torch.ones(batch_size, dtype=torch.float32, device=device)
+        metrics = {
+            "self_distillation/teacher_always_on_fraction": 1.0,
+            "self_distillation/same_image_bbox_mask_fraction": 1.0,
+            "self_distillation/teacher_target_visual_tokens": float(target_token_count),
+            "self_distillation/teacher_background_visual_tokens": float(background_token_count),
+            "self_distillation/teacher_kept_background_visual_tokens": float(kept_background_token_count),
+            "self_distillation/teacher_kept_visual_tokens": float(kept_visual_tokens),
+            "self_distillation/teacher_visual_keep_ratio": kept_visual_tokens / max(total_visual_tokens, 1),
+            "self_distillation/teacher_llm_effective_tokens": float(teacher_llm_effective_tokens),
+            "self_distillation/policy_fallback_fraction": 0.0,
+            "self_distillation/grpo_fallback_count": 0.0,
+        }
+        return DataProto.from_dict(
+            tensors={
+                "teacher_input_ids": input_ids,
+                "teacher_attention_mask": teacher_attention_mask,
+                "teacher_position_ids": batch.batch["position_ids"],
+                "teacher_response_start_idx": torch.full(
+                    (batch_size,), prompt_length, dtype=torch.long, device=device
+                ),
+                "self_distillation_mask": teacher_present_mask,
+            },
+            non_tensors={"teacher_multi_modal_inputs": teacher_multi_modal_inputs},
+        ), metrics
 
     def _maybe_build_self_distillation_batch(
         self,
@@ -1164,6 +1302,13 @@ class RayPPOTrainer:
             and self_distillation_cfg.get("teacher_image_key", None) is not None
             and not use_opsd_answer_hint
         )
+
+        use_same_image_bbox_mask = (
+            self_distillation_cfg.get("teacher_always_on", False)
+            and self_distillation_cfg.get("teacher_visual_token_mode", "crop") == "same_image_bbox_mask"
+        )
+        if use_same_image_bbox_mask:
+            return self._build_same_image_sparse_teacher_batch(batch, self_distillation_cfg)
 
         if use_opsd_answer_hint:
             answer_hint_template = self_distillation_cfg.get(
@@ -1512,9 +1657,14 @@ class RayPPOTrainer:
             set({"data_source", "reward_model", "extra_info", "uid", "raw_prompt", "teacher_prompt"})
             & batch.non_tensor_batch.keys()
         )
-        teacher_image_key = self.config.actor_rollout_ref.actor.get("self_distillation", {}).get("teacher_image_key", None)
+        self_distillation_cfg = self.config.actor_rollout_ref.actor.get("self_distillation", {})
+        teacher_image_key = self_distillation_cfg.get("teacher_image_key", None)
         if teacher_image_key and teacher_image_key in batch.non_tensor_batch:
             reward_model_keys.add(teacher_image_key)
+        if self_distillation_cfg.get("teacher_visual_token_mode", "crop") == "same_image_bbox_mask":
+            bbox_key = self_distillation_cfg.get("teacher_bbox_key", "bbox")
+            sparse_teacher_metadata = {bbox_key, "image_width", "image_height", "index"}
+            reward_model_keys.update(sparse_teacher_metadata & batch.non_tensor_batch.keys())
 
         # pop those keys for generation
         batch_keys_to_pop = []

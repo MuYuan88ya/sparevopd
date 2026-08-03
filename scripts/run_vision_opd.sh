@@ -17,6 +17,8 @@ MODEL_PATH="Qwen/Qwen3.5-4B"
 TEACHER_MODEL_SOURCE="legacy"
 TEACHER_REGULARIZATION="ema"
 TEACHER_UPDATE_RATE=0.05
+TEACHER_VISUAL_TOKEN_MODE="same_image_bbox_mask"
+TEACHER_VISUAL_TOKEN_SEED=0
 
 TRAIN_BATCH_SIZE=96
 PPO_MIMI_BATCH_SIZE=96
@@ -83,6 +85,7 @@ echo "Running: $EXPERIMENT_NAME"
 echo "Teacher model source: $TEACHER_MODEL_SOURCE"
 echo "Teacher regularization: $TEACHER_REGULARIZATION"
 echo "Teacher update rate: $TEACHER_UPDATE_RATE"
+echo "Teacher visual token mode: $TEACHER_VISUAL_TOKEN_MODE"
 
 python3 -m verl.trainer.main_ppo --config-name "$CONFIG_NAME" \
     data.train_files="[\"$TASK_TRAIN_FILE\"]" \
@@ -120,7 +123,11 @@ python3 -m verl.trainer.main_ppo --config-name "$CONFIG_NAME" \
     actor_rollout_ref.actor.self_distillation.teacher_model_source=$TEACHER_MODEL_SOURCE \
     actor_rollout_ref.actor.self_distillation.teacher_regularization=$TEACHER_REGULARIZATION \
     actor_rollout_ref.actor.self_distillation.teacher_update_rate=$TEACHER_UPDATE_RATE \
-    actor_rollout_ref.actor.self_distillation.teacher_image_key=bbox_images \
+    actor_rollout_ref.actor.self_distillation.teacher_visual_token_mode=$TEACHER_VISUAL_TOKEN_MODE \
+    actor_rollout_ref.actor.self_distillation.teacher_bbox_key=bbox \
+    actor_rollout_ref.actor.self_distillation.teacher_background_keep_ratio=0.1 \
+    actor_rollout_ref.actor.self_distillation.teacher_background_sampling=fixed_stratified \
+    actor_rollout_ref.actor.self_distillation.teacher_visual_token_seed=$TEACHER_VISUAL_TOKEN_SEED \
     algorithm.rollout_correction.rollout_is=token \
     algorithm.rollout_correction.rollout_is_threshold=2.0 \
     algorithm.adv_estimator=grpo \

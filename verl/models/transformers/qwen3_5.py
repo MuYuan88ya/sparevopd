@@ -99,11 +99,20 @@ def _get_input_embeds(
     pixel_values_videos: Optional[torch.FloatTensor] = None,
     image_grid_thw: Optional[torch.LongTensor] = None,
     video_grid_thw: Optional[torch.LongTensor] = None,
+    image_token_keep_mask: Optional[torch.BoolTensor] = None,
 ):
     inputs_embeds = model.get_input_embeddings()(input_ids)
     if pixel_values is not None:
         pixel_values = pixel_values.type(model.visual.dtype)
         image_embeds = model.visual(pixel_values, grid_thw=image_grid_thw).pooler_output
+        if image_token_keep_mask is not None:
+            image_token_keep_mask = image_token_keep_mask.to(device=image_embeds.device, dtype=torch.bool).flatten()
+            if image_token_keep_mask.numel() != image_embeds.shape[0]:
+                raise ValueError(
+                    "Image token keep mask and dense image features do not match: "
+                    f"mask: {image_token_keep_mask.numel()}, features: {image_embeds.shape[0]}"
+                )
+            image_embeds = image_embeds[image_token_keep_mask]
         n_image_tokens = (input_ids == model.config.image_token_id).sum().item()
         n_image_features = image_embeds.shape[0]
         if n_image_tokens != n_image_features:
@@ -159,10 +168,18 @@ def qwen3_5_base_forward(
     pixel_values_videos: Optional[torch.FloatTensor] = None,
     image_grid_thw: Optional[torch.LongTensor] = None,
     video_grid_thw: Optional[torch.LongTensor] = None,
+    image_token_keep_mask: Optional[torch.BoolTensor] = None,
     **kwargs,
 ):
     input_kwargs = _get_input_embeds(
-        self, input_ids, attention_mask, pixel_values, pixel_values_videos, image_grid_thw, video_grid_thw
+        self,
+        input_ids,
+        attention_mask,
+        pixel_values,
+        pixel_values_videos,
+        image_grid_thw,
+        video_grid_thw,
+        image_token_keep_mask,
     )
     kwargs.update(input_kwargs)
     return self.language_model(
