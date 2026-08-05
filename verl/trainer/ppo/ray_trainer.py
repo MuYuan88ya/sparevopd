@@ -70,7 +70,6 @@ from verl.utils.metric import reduce_metrics
 from verl.utils.py_functional import rename_dict
 from verl.utils.rollout_skip import RolloutSkip
 from verl.utils.seqlen_balancing import calculate_workload, get_seqlen_balanced_partitions, log_seqlen_unbalance
-from verl.utils.teacher_visual_token_mask import apply_image_token_keep_mask, build_bbox_sparse_keep_mask
 from verl.utils.torch_functional import masked_mean
 from verl.utils.torch_functional import postprocess_data
 from verl.utils.tracking import ValidationGenerationsLogger
@@ -1167,22 +1166,9 @@ class RayPPOTrainer:
                 f"and response length {responses.shape[1]}"
             )
 
-        image_token_id = int(self.processor.image_token_id)
         merge_size = int(self.processor.image_processor.merge_size)
-        background_keep_ratio = float(self_distillation_cfg.get("teacher_background_keep_ratio", 0.1))
-        background_sampling = self_distillation_cfg.get("teacher_background_sampling", "fixed_stratified")
-        if background_sampling != "fixed_stratified":
-            raise ValueError(
-                "same_image_bbox_mask requires teacher_background_sampling='fixed_stratified', "
-                f"got {background_sampling!r}"
-            )
-        seed = int(self_distillation_cfg.get("teacher_visual_token_seed", 0))
-
         teacher_attention_mask = attention_mask.clone()
-        teacher_multi_modal_inputs = []
-        target_token_count = 0
-        background_token_count = 0
-        kept_background_token_count = 0
+        selection_metadata = []
 
         for sample_idx in range(batch_size):
             self._raise_if_response_contains_visual_special_tokens(
@@ -1213,49 +1199,26 @@ class RayPPOTrainer:
                     f"image grid {(patch_grid_height, patch_grid_width)} is not divisible by merge size {merge_size}"
                 )
 
-            selection = build_bbox_sparse_keep_mask(
-                bbox=batch.non_tensor_batch[bbox_key][sample_idx],
-                image_width=int(batch.non_tensor_batch["image_width"][sample_idx]),
-                image_height=int(batch.non_tensor_batch["image_height"][sample_idx]),
-                grid_height=patch_grid_height // merge_size,
-                grid_width=patch_grid_width // merge_size,
-                background_keep_ratio=background_keep_ratio,
-                sample_id=batch.non_tensor_batch["index"][sample_idx],
-                seed=seed,
+            image_width = int(batch.non_tensor_batch["image_width"][sample_idx])
+            image_height = int(batch.non_tensor_batch["image_height"][sample_idx])
+            if image_width <= 0 or image_height <= 0:
+                raise ValueError(
+                    f"same_image_bbox_mask requires positive image dimensions, got {(image_width, image_height)}"
+                )
+            selection_metadata.append(
+                {
+                    "bbox": batch.non_tensor_batch[bbox_key][sample_idx],
+                    "image_width": image_width,
+                    "image_height": image_height,
+                    "sample_id": batch.non_tensor_batch["index"][sample_idx],
+                }
             )
-            teacher_attention_mask[sample_idx] = apply_image_token_keep_mask(
-                input_ids=input_ids[sample_idx],
-                attention_mask=attention_mask[sample_idx],
-                image_token_id=image_token_id,
-                image_token_keep_mask=selection.keep_mask,
-            )
-            if not torch.equal(
-                teacher_attention_mask[sample_idx, prompt_length:],
-                attention_mask[sample_idx, prompt_length:],
-            ):
-                raise RuntimeError(f"Sparse teacher masking modified response tokens for sample {sample_idx}")
 
-            sparse_multi_modal_inputs = dict(multi_modal_inputs)
-            sparse_multi_modal_inputs["image_token_keep_mask"] = selection.keep_mask
-            teacher_multi_modal_inputs.append(sparse_multi_modal_inputs)
-            target_token_count += selection.target_token_count
-            background_token_count += selection.background_token_count
-            kept_background_token_count += selection.kept_background_token_count
-
-        total_visual_tokens = target_token_count + background_token_count
-        kept_visual_tokens = target_token_count + kept_background_token_count
-        teacher_llm_effective_tokens = int(teacher_attention_mask.sum().item())
         device = input_ids.device
         teacher_present_mask = torch.ones(batch_size, dtype=torch.float32, device=device)
         metrics = {
             "self_distillation/teacher_always_on_fraction": 1.0,
             "self_distillation/same_image_bbox_mask_fraction": 1.0,
-            "self_distillation/teacher_target_visual_tokens": float(target_token_count),
-            "self_distillation/teacher_background_visual_tokens": float(background_token_count),
-            "self_distillation/teacher_kept_background_visual_tokens": float(kept_background_token_count),
-            "self_distillation/teacher_kept_visual_tokens": float(kept_visual_tokens),
-            "self_distillation/teacher_visual_keep_ratio": kept_visual_tokens / max(total_visual_tokens, 1),
-            "self_distillation/teacher_llm_effective_tokens": float(teacher_llm_effective_tokens),
             "self_distillation/policy_fallback_fraction": 0.0,
             "self_distillation/grpo_fallback_count": 0.0,
         }
@@ -1269,7 +1232,7 @@ class RayPPOTrainer:
                 ),
                 "self_distillation_mask": teacher_present_mask,
             },
-            non_tensors={"teacher_multi_modal_inputs": teacher_multi_modal_inputs},
+            non_tensors={"teacher_visual_token_selection_metadata": selection_metadata},
         ), metrics
 
     def _maybe_build_self_distillation_batch(

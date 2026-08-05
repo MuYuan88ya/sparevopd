@@ -148,14 +148,13 @@ self_distillation:
   # Dataset column containing [x1, y1, x2, y2] in source-image coordinates
   teacher_bbox_key: bbox
 
-  # Fraction of non-target merged visual tokens retained by the same-image teacher
-  teacher_background_keep_ratio: 0.1
+  # Registered strategy that selects merged visual tokens after the student forward
+  teacher_visual_token_selection_strategy: fixed_stratified
 
-  # Deterministic spatial background sampling strategy
-  teacher_background_sampling: fixed_stratified
-
-  # Stable seed mixed with the sample index for background selection
-  teacher_visual_token_seed: 0
+  # Keyword arguments passed directly to the registered strategy
+  teacher_visual_token_selection_kwargs:
+    background_keep_ratio: 0.1
+    seed: 0
 
   # Teacher prompt mode: null for SDPO (image swap), "answer_hint" for OPSD (text hint)
   teacher_prompt_mode: null

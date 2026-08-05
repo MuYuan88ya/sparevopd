@@ -31,11 +31,24 @@
 - 教师和学生必须使用相同的原始图片、prompt 和图像预处理结果。
 - bbox 只用于构造教师视觉 Token keep mask，不作为额外文本提示输入模型。
 - 教师保留全部目标 Token，并按固定规则选择一部分框外 Token。
-- 背景保留比例由 `teacher_background_keep_ratio` 配置，取值范围为 `[0, 1]`，默认值为 `0.1`。
+- 视觉 Token 选择由 `teacher_visual_token_selection_strategy` 指定的注册策略完成；策略参数通过 `teacher_visual_token_selection_kwargs` 传入。内置 `fixed_stratified` 的背景保留比例默认是 `0.1`。
 - 当前实现仍由 ViT 编码完整图像，筛选发生在合并后的视觉特征进入 LLM 之前。
 - 被丢弃的视觉占位符通过 `attention_mask` 和 `unpad_input` 从教师 LLM 序列中移除。
 - 教师只评价学生生成的 rollout，执行 `torch.no_grad()` forward，不进行生成或反向传播。
 - 学生始终使用完整视觉 Token，训练目标仍是论文中的 on-policy 蒸馏。
+
+## 学生视觉特征选择平台
+
+启用 `same_image_bbox_mask` 后，学生 forward 始终额外返回一份 detached 的 dense 合并视觉特征。actor 在学生 forward 完成后、教师 `unpad_input` 之前，将以下固定输入交给已注册的视觉 Token 选择策略：
+
+- 学生的 dense `image_embeds`。
+- 每张图的 `image_grid_thw`。
+- bbox 映射得到的目标区域 mask。
+- 稳定的样本编号。
+
+策略返回最终 keep mask 和可选指标后，actor 才修改教师 `attention_mask`，然后执行教师 forward。这样未来可以注册相似度、多样性、聚类或可学习选择器，不需要再次调整教师 unpadding 和 LLM 输入路径。
+
+当前 `fixed_stratified` 策略按照 Morton 空间顺序分层并确定性抽样。学生 embedding 已经进入策略接口并完成形状与 batch 对齐检查，但当前策略不读取 embedding 数值进行排序。因此现阶段不能将方法描述为 embedding-similarity selection；这次改动建立的是后续特征选择实验所需的平台和正确时序。
 
 ## 研究表述
 

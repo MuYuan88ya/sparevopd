@@ -100,11 +100,14 @@ def _get_input_embeds(
     image_grid_thw: Optional[torch.LongTensor] = None,
     video_grid_thw: Optional[torch.LongTensor] = None,
     image_token_keep_mask: Optional[torch.BoolTensor] = None,
+    return_image_embeds: bool = False,
 ):
     inputs_embeds = model.get_input_embeddings()(input_ids)
+    dense_image_embeds = None
     if pixel_values is not None:
         pixel_values = pixel_values.type(model.visual.dtype)
-        image_embeds = model.visual(pixel_values, grid_thw=image_grid_thw).pooler_output
+        dense_image_embeds = model.visual(pixel_values, grid_thw=image_grid_thw).pooler_output
+        image_embeds = dense_image_embeds
         if image_token_keep_mask is not None:
             image_token_keep_mask = image_token_keep_mask.to(device=image_embeds.device, dtype=torch.bool).flatten()
             if image_token_keep_mask.numel() != image_embeds.shape[0]:
@@ -157,7 +160,12 @@ def _get_input_embeds(
     if attention_mask is not None:
         attention_mask = attention_mask.to(inputs_embeds.device)
 
-    return {"inputs_embeds": inputs_embeds, "attention_mask": attention_mask}
+    output = {"inputs_embeds": inputs_embeds, "attention_mask": attention_mask}
+    if return_image_embeds:
+        if dense_image_embeds is None:
+            raise ValueError("return_image_embeds=True requires real image pixel_values")
+        output["image_embeds"] = dense_image_embeds.detach()
+    return output
 
 
 def qwen3_5_base_forward(
@@ -169,6 +177,7 @@ def qwen3_5_base_forward(
     image_grid_thw: Optional[torch.LongTensor] = None,
     video_grid_thw: Optional[torch.LongTensor] = None,
     image_token_keep_mask: Optional[torch.BoolTensor] = None,
+    return_image_embeds: bool = False,
     **kwargs,
 ):
     input_kwargs = _get_input_embeds(
@@ -180,18 +189,24 @@ def qwen3_5_base_forward(
         image_grid_thw,
         video_grid_thw,
         image_token_keep_mask,
+        return_image_embeds,
     )
+    image_embeds = input_kwargs.pop("image_embeds", None)
     kwargs.update(input_kwargs)
-    return self.language_model(
+    outputs = self.language_model(
         input_ids=None,
         **kwargs,
     )
+    if image_embeds is not None:
+        outputs.image_embeds = image_embeds
+    return outputs
 
 
 @dataclass
 class Qwen3_5CausalLMOutputForPPO(Qwen3_5CausalLMOutputWithPast):
     log_probs: Optional[torch.FloatTensor] = None
     entropy: Optional[torch.FloatTensor] = None
+    image_embeds: Optional[torch.FloatTensor] = None
 
 
 def forward_with_normal_backend(
@@ -207,6 +222,7 @@ def forward_with_normal_backend(
     return Qwen3_5CausalLMOutputForPPO(
         logits=logits,
         hidden_states=outputs.hidden_states,
+        image_embeds=getattr(outputs, "image_embeds", None),
     )
 
 
@@ -240,6 +256,7 @@ def forward_with_torch_backend(
         log_probs=log_probs,
         entropy=entropy,
         hidden_states=outputs.hidden_states,
+        image_embeds=getattr(outputs, "image_embeds", None),
     )
 
 
@@ -273,4 +290,5 @@ def forward_with_triton_backend(
         log_probs=log_probs,
         entropy=entropy,
         hidden_states=outputs.hidden_states,
+        image_embeds=getattr(outputs, "image_embeds", None),
     )

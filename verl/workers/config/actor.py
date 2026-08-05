@@ -69,9 +69,8 @@ class SelfDistillationConfig(BaseConfig):
         teacher_image_key (Optional[str]): Dataset column holding teacher-side images for multimodal distillation.
         teacher_visual_token_mode (str): "crop" or "same_image_bbox_mask".
         teacher_bbox_key (str): Dataset column holding source-image bounding boxes.
-        teacher_background_keep_ratio (float): Fraction of non-target merged image tokens kept by the teacher.
-        teacher_background_sampling (str): Deterministic background sampling strategy.
-        teacher_visual_token_seed (int): Seed mixed with the stable sample index for background selection.
+        teacher_visual_token_selection_strategy (str): Registered strategy used to select teacher image tokens.
+        teacher_visual_token_selection_kwargs (dict[str, Any]): Keyword arguments passed to the strategy factory.
         fallback_to_policy_loss_on_missing_teacher (bool): When teacher_always_on=True, fall back to vanilla
             policy loss for samples whose teacher_image_key column is empty.
         log_prob_dump_dir (Optional[str]): Optional directory used to dump student/teacher log-prob tensors for each step.
@@ -113,9 +112,10 @@ class SelfDistillationConfig(BaseConfig):
     teacher_image_key: Optional[str] = None
     teacher_visual_token_mode: str = "crop"
     teacher_bbox_key: str = "bbox"
-    teacher_background_keep_ratio: float = 0.1
-    teacher_background_sampling: str = "fixed_stratified"
-    teacher_visual_token_seed: int = 0
+    teacher_visual_token_selection_strategy: str = "fixed_stratified"
+    teacher_visual_token_selection_kwargs: dict[str, Any] = field(
+        default_factory=lambda: {"background_keep_ratio": 0.1, "seed": 0}
+    )
     teacher_prompt_mode: Optional[str] = None
     answer_hint_template: str = (
         "\n\nHere is a reference solution to this problem:\n"
@@ -161,17 +161,13 @@ class SelfDistillationConfig(BaseConfig):
                 "self_distillation.teacher_visual_token_mode must be one of "
                 f"{valid_visual_token_modes}, got {self.teacher_visual_token_mode}"
             )
-        if not 0.0 <= self.teacher_background_keep_ratio <= 1.0:
-            raise ValueError(
-                "self_distillation.teacher_background_keep_ratio must be in [0,1], "
-                f"got {self.teacher_background_keep_ratio}"
-            )
-        if self.teacher_background_sampling != "fixed_stratified":
-            raise ValueError(
-                "self_distillation.teacher_background_sampling must be 'fixed_stratified', "
-                f"got {self.teacher_background_sampling}"
-            )
         sparse_same_image = self.teacher_visual_token_mode == "same_image_bbox_mask"
+        if not self.teacher_visual_token_selection_strategy:
+            raise ValueError("self_distillation.teacher_visual_token_selection_strategy must not be empty")
+        if not isinstance(self.teacher_visual_token_selection_kwargs, dict):
+            raise TypeError("self_distillation.teacher_visual_token_selection_kwargs must be a dictionary")
+        if sparse_same_image and not self.teacher_always_on:
+            raise ValueError("same_image_bbox_mask requires self_distillation.teacher_always_on=True")
         if sparse_same_image and not self.teacher_bbox_key:
             raise ValueError("self_distillation.teacher_bbox_key is required for same_image_bbox_mask")
         if sparse_same_image and self.teacher_prompt_mode is not None:

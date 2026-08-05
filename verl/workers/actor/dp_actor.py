@@ -38,6 +38,12 @@ from verl.utils.metric import AggregationType, Metric, reduce_metrics
 from verl.utils.profiler import GPUMemoryLogger
 from verl.utils.py_functional import append_to_dict
 from verl.utils.seqlen_balancing import prepare_dynamic_batch, restore_dynamic_batch
+from verl.utils.teacher_visual_token_mask import (
+    apply_image_token_keep_mask,
+    build_bbox_target_keep_mask,
+    create_visual_token_selection_strategy,
+    select_batched_visual_tokens,
+)
 from verl.utils.torch_dtypes import PrecisionType
 from verl.utils.torch_functional import logprobs_from_logits
 from verl.utils.ulysses import gather_outputs_and_unpad, slice_input_tensor, ulysses_pad, ulysses_pad_and_slice_inputs
@@ -118,6 +124,23 @@ class DataParallelPPOActor(BasePPOActor):
         else:
             self.scaler = None
 
+        self.teacher_visual_token_selection_strategy = None
+        self_distillation_cfg = getattr(self.config, "self_distillation", None)
+        if (
+            self_distillation_cfg is not None
+            and self_distillation_cfg.get("teacher_visual_token_mode", "crop") == "same_image_bbox_mask"
+        ):
+            if not self.use_remove_padding:
+                raise ValueError("same_image_bbox_mask requires actor.use_remove_padding=True")
+            strategy_name = self_distillation_cfg.get(
+                "teacher_visual_token_selection_strategy", "fixed_stratified"
+            )
+            strategy_kwargs = self_distillation_cfg.get("teacher_visual_token_selection_kwargs", {})
+            self.teacher_visual_token_selection_strategy = create_visual_token_selection_strategy(
+                strategy_name,
+                strategy_kwargs,
+            )
+
         # Sum of squared probabilities computation (for optimal_token_baseline)
         # Only initialize if calculate_sum_pi_squared config is enabled
         if self.config.get("calculate_sum_pi_squared", False):
@@ -150,6 +173,7 @@ class DataParallelPPOActor(BasePPOActor):
                 for teacher_param, student_param in zip(
                     self.teacher_module.parameters(),
                     self.actor_module.parameters(),
+                    strict=True,
                 ):
                     student_data = student_param.data.to(device=teacher_param.device)
                     teacher_param.data.mul_(1.0 - update_rate).add_(student_data, alpha=update_rate)
@@ -165,11 +189,13 @@ class DataParallelPPOActor(BasePPOActor):
                 for teacher_param, student_param in zip(
                     self.teacher_module.parameters(),
                     self.actor_module.parameters(),
+                    strict=True,
                 ):
                     teacher_param.data.copy_(student_param.data.to(device=teacher_param.device))
                 for teacher_buffer, student_buffer in zip(
                     self.teacher_module.buffers(),
                     self.actor_module.buffers(),
+                    strict=True,
                 ):
                     teacher_buffer.data.copy_(student_buffer.data.to(device=teacher_buffer.device))
                 return
@@ -196,6 +222,191 @@ class DataParallelPPOActor(BasePPOActor):
             else:
                 return True
         return False
+
+    def _get_actor_image_token_id(self) -> int:
+        candidates = [self.actor_module]
+        visited = set()
+        while candidates:
+            module = candidates.pop(0)
+            if module is None or id(module) in visited:
+                continue
+            visited.add(id(module))
+            config = getattr(module, "config", None)
+            image_token_id = getattr(config, "image_token_id", None)
+            if image_token_id is not None:
+                return int(image_token_id)
+            for attr_name in ("module", "_fsdp_wrapped_module", "base_model", "model"):
+                child = getattr(module, attr_name, None)
+                if child is not None and child is not module:
+                    candidates.append(child)
+        raise ValueError("Student-embedding visual selection requires a model config with image_token_id")
+
+    def _get_actor_spatial_merge_size(self) -> int:
+        candidates = [self.actor_module]
+        visited = set()
+        while candidates:
+            module = candidates.pop(0)
+            if module is None or id(module) in visited:
+                continue
+            visited.add(id(module))
+            config = getattr(module, "config", None)
+            vision_config = getattr(config, "vision_config", None)
+            merge_size = getattr(vision_config, "spatial_merge_size", None)
+            if merge_size is not None:
+                return int(merge_size)
+            for attr_name in ("module", "_fsdp_wrapped_module", "base_model", "model"):
+                child = getattr(module, attr_name, None)
+                if child is not None and child is not module:
+                    candidates.append(child)
+        raise ValueError("Visual token selection requires a model vision config with spatial_merge_size")
+
+    @torch.no_grad()
+    def _finalize_teacher_visual_token_mask(
+        self,
+        teacher_inputs: dict,
+        selection_metadata,
+        student_image_embeds: Optional[torch.Tensor],
+    ) -> tuple[dict, dict[str, float]]:
+        if student_image_embeds is None:
+            raise ValueError("Student forward did not return dense image embeddings for teacher token selection")
+        if self.teacher_visual_token_selection_strategy is None:
+            raise ValueError("Teacher visual token selection strategy was not initialized")
+        raw_multi_modal_inputs = teacher_inputs.get("multi_modal_inputs")
+        if raw_multi_modal_inputs is None:
+            raise ValueError("Student-embedding visual selection requires teacher multi_modal_inputs")
+
+        if isinstance(raw_multi_modal_inputs, dict):
+            raw_multi_modal_inputs = [raw_multi_modal_inputs]
+        else:
+            raw_multi_modal_inputs = list(raw_multi_modal_inputs)
+        batch_size = teacher_inputs["input_ids"].shape[0]
+        if len(raw_multi_modal_inputs) != batch_size:
+            raise ValueError(
+                "Teacher multimodal inputs must contain one item per sample, "
+                f"got items={len(raw_multi_modal_inputs)} and batch={batch_size}"
+            )
+
+        if selection_metadata is None:
+            raise ValueError("Teacher visual token selection metadata is missing")
+        if isinstance(selection_metadata, dict):
+            selection_metadata = [selection_metadata]
+        else:
+            selection_metadata = list(selection_metadata)
+        if len(selection_metadata) != batch_size:
+            raise ValueError(
+                "Teacher visual token selection metadata must contain one item per sample, "
+                f"got items={len(selection_metadata)} and batch={batch_size}"
+            )
+
+        normalized_inputs = []
+        image_grids = []
+        target_keep_masks = []
+        sample_ids = []
+        merge_size = self._get_actor_spatial_merge_size()
+        for sample_idx, inputs in enumerate(raw_multi_modal_inputs):
+            inputs = getattr(inputs, "data", inputs)
+            if not isinstance(inputs, dict):
+                raise TypeError(f"Teacher multi_modal_inputs[{sample_idx}] must be a dict, got {type(inputs)}")
+            image_grid_thw = inputs.get("image_grid_thw")
+            if image_grid_thw is None or image_grid_thw.shape != (1, 3):
+                shape = None if image_grid_thw is None else tuple(image_grid_thw.shape)
+                raise ValueError(
+                    "Student-embedding visual selection supports one image per sample, "
+                    f"got image_grid_thw={shape} for sample {sample_idx}"
+                )
+            grid_t, patch_grid_height, patch_grid_width = (
+                int(value) for value in image_grid_thw[0].tolist()
+            )
+            if grid_t != 1:
+                raise ValueError(f"Teacher visual token selection supports static images only, got grid_t={grid_t}")
+            if patch_grid_height % merge_size or patch_grid_width % merge_size:
+                raise ValueError(
+                    f"image grid {(patch_grid_height, patch_grid_width)} is not divisible by merge size {merge_size}"
+                )
+
+            metadata = getattr(selection_metadata[sample_idx], "data", selection_metadata[sample_idx])
+            if not isinstance(metadata, dict):
+                raise TypeError(
+                    f"Teacher visual token selection metadata[{sample_idx}] must be a dict, got {type(metadata)}"
+                )
+            required_metadata = {"bbox", "image_width", "image_height", "sample_id"}
+            missing_metadata = required_metadata - set(metadata)
+            if missing_metadata:
+                raise KeyError(
+                    f"Teacher visual token selection metadata[{sample_idx}] is missing {sorted(missing_metadata)}"
+                )
+            target_keep_mask = build_bbox_target_keep_mask(
+                bbox=metadata["bbox"],
+                image_width=int(metadata["image_width"]),
+                image_height=int(metadata["image_height"]),
+                grid_height=patch_grid_height // merge_size,
+                grid_width=patch_grid_width // merge_size,
+            )
+            normalized_inputs.append(dict(inputs))
+            image_grids.append(image_grid_thw)
+            target_keep_masks.append(target_keep_mask)
+            sample_ids.append(metadata["sample_id"])
+
+        selection_outputs = select_batched_visual_tokens(
+            strategy=self.teacher_visual_token_selection_strategy,
+            image_embeds=student_image_embeds,
+            image_grid_thw=torch.cat(image_grids, dim=0),
+            target_keep_masks=target_keep_masks,
+            sample_ids=sample_ids,
+        )
+
+        image_token_id = self._get_actor_image_token_id()
+        original_attention_mask = teacher_inputs["attention_mask"]
+        teacher_attention_mask = original_attention_mask.clone()
+        finalized_multi_modal_inputs = []
+        response_start_idx = teacher_inputs["response_start_idx"]
+        target_token_count = 0
+        background_token_count = 0
+        kept_background_token_count = 0
+        strategy_metrics: dict[str, float] = {}
+        for sample_idx, (inputs, target_keep_mask, selection_output) in enumerate(
+            zip(normalized_inputs, target_keep_masks, selection_outputs, strict=True)
+        ):
+            keep_mask = selection_output.keep_mask
+            teacher_attention_mask[sample_idx] = apply_image_token_keep_mask(
+                input_ids=teacher_inputs["input_ids"][sample_idx],
+                attention_mask=original_attention_mask[sample_idx],
+                image_token_id=image_token_id,
+                image_token_keep_mask=keep_mask,
+            )
+            response_start = int(response_start_idx[sample_idx].item())
+            if not torch.equal(
+                teacher_attention_mask[sample_idx, response_start:],
+                original_attention_mask[sample_idx, response_start:],
+            ):
+                raise RuntimeError(f"Student-embedding selector modified response tokens for sample {sample_idx}")
+
+            inputs["image_token_keep_mask"] = keep_mask
+            finalized_multi_modal_inputs.append(inputs)
+
+            target_token_count += int(target_keep_mask.sum().item())
+            background_token_count += int((~target_keep_mask).sum().item())
+            kept_background_token_count += int((keep_mask.cpu() & ~target_keep_mask).sum().item())
+            for key, value in selection_output.metrics.items():
+                strategy_metrics[key] = strategy_metrics.get(key, 0.0) + float(value)
+
+        finalized_teacher_inputs = dict(teacher_inputs)
+        finalized_teacher_inputs["attention_mask"] = teacher_attention_mask
+        finalized_teacher_inputs["multi_modal_inputs"] = finalized_multi_modal_inputs
+        total_visual_tokens = target_token_count + background_token_count
+        kept_visual_tokens = target_token_count + kept_background_token_count
+        metrics = {
+            "actor/teacher_target_visual_tokens": float(target_token_count),
+            "actor/teacher_background_visual_tokens": float(background_token_count),
+            "actor/teacher_kept_background_visual_tokens": float(kept_background_token_count),
+            "actor/teacher_kept_visual_tokens": float(kept_visual_tokens),
+            "actor/teacher_visual_keep_ratio": kept_visual_tokens / max(total_visual_tokens, 1),
+            "actor/teacher_llm_effective_tokens": float(teacher_attention_mask.sum().item()),
+        }
+        metrics.update(
+            {f"actor/teacher_visual_strategy/{key}": value for key, value in strategy_metrics.items()}
+        )
+        return finalized_teacher_inputs, metrics
 
     @staticmethod
     def _add_tail_bucket(log_probs: torch.Tensor) -> torch.Tensor:
@@ -305,6 +516,7 @@ class DataParallelPPOActor(BasePPOActor):
         distill_topk: Optional[int] = None,
         topk_indices: Optional[torch.Tensor] = None,
         module: Optional[nn.Module] = None,
+        return_image_embeds: bool = False,
     ) -> dict[str, torch.Tensor]:
         """
         Returns:
@@ -371,6 +583,7 @@ class DataParallelPPOActor(BasePPOActor):
                         f"response_start_idx shape must be ({batch_size},), got {tuple(response_start_idx.shape)}"
                     )
             entropy = None
+            model_image_embeds = None
             if position_ids.dim() == 3:  # qwen2vl mrope
                 position_ids = position_ids.transpose(0, 1)  # (bsz, 4, seqlen) -> (4, bsz, seqlen)
 
@@ -454,6 +667,8 @@ class DataParallelPPOActor(BasePPOActor):
                 if self.use_fused_kernels:
                     extra_args["temperature"] = temperature
                     extra_args["return_dict"] = True
+                if return_image_embeds:
+                    extra_args["return_image_embeds"] = True
 
                 output = model(
                     input_ids=input_ids_rmpad,
@@ -463,6 +678,7 @@ class DataParallelPPOActor(BasePPOActor):
                     use_cache=False,
                     **extra_args,
                 )  # prevent model thinks we are generating
+                model_image_embeds = getattr(output, "image_embeds", None)
 
                 if self.use_fused_kernels:
                     log_probs = output.log_probs.squeeze(0)  # (total_nnz,)
@@ -668,6 +884,8 @@ class DataParallelPPOActor(BasePPOActor):
                 if self.use_fused_kernels:
                     extra_args["temperature"] = temperature
                     extra_args["return_dict"] = True
+                if return_image_embeds:
+                    extra_args["return_image_embeds"] = True
 
                 output = model(
                     input_ids=input_ids,
@@ -677,6 +895,7 @@ class DataParallelPPOActor(BasePPOActor):
                     use_cache=False,
                     **extra_args,
                 )  # prevent model thinks we are generating
+                model_image_embeds = getattr(output, "image_embeds", None)
 
                 if self.use_fused_kernels:
                     log_probs = output.log_probs[:, -response_length - 1 : -1]
@@ -726,6 +945,10 @@ class DataParallelPPOActor(BasePPOActor):
                 outputs["topk_logps"] = topk_logps
                 if return_topk_indices:
                     outputs["topk_indices"] = topk_indices
+            if return_image_embeds:
+                if model_image_embeds is None:
+                    raise ValueError("Model did not return image_embeds when return_image_embeds=True")
+                outputs["image_embeds"] = model_image_embeds
             return outputs
 
     def _optimizer_step(self):
@@ -900,6 +1123,8 @@ class DataParallelPPOActor(BasePPOActor):
             non_tensor_select_keys.append("multi_modal_inputs")
         if has_teacher_multi_modal_inputs:
             non_tensor_select_keys.append("teacher_multi_modal_inputs")
+        if "teacher_visual_token_selection_metadata" in data.non_tensor_batch:
+            non_tensor_select_keys.append("teacher_visual_token_selection_metadata")
         if self.use_prefix_grouper and "uid" in data.non_tensor_batch.keys():
             non_tensor_select_keys.append("uid")
 
@@ -977,6 +1202,11 @@ class DataParallelPPOActor(BasePPOActor):
                     # all return: (bsz, response_length)
                     return_all_logps = self_distillation_cfg.full_logit_distillation and not self_distillation_cfg.distillation_topk
                     distill_topk = self_distillation_cfg.distillation_topk if self_distillation_cfg.full_logit_distillation else None
+                    use_visual_token_strategy = bool(
+                        self_distillation_enabled
+                        and self_distillation_cfg.get("teacher_visual_token_mode", "crop")
+                        == "same_image_bbox_mask"
+                    )
                     student_forward_start = time.perf_counter()
                     outputs = self._forward_micro_batch(
                         model_inputs,
@@ -984,6 +1214,7 @@ class DataParallelPPOActor(BasePPOActor):
                         calculate_entropy=calculate_entropy,
                         return_all_logps=return_all_logps,
                         distill_topk=distill_topk,
+                        return_image_embeds=use_visual_token_strategy,
                     )
                     if self_distillation_enabled:
                         student_forward_time = time.perf_counter() - student_forward_start
@@ -993,6 +1224,7 @@ class DataParallelPPOActor(BasePPOActor):
                     student_all_logps = outputs.get("all_logps") if return_all_logps else None
                     student_topk_logps = outputs.get("topk_logps") if distill_topk else None
                     student_topk_indices = outputs.get("topk_indices") if distill_topk else None
+                    student_image_embeds = outputs.pop("image_embeds", None)
 
                     # for fully_async_policy
                     if hasattr(self.config, "use_rollout_log_probs") and self.config.use_rollout_log_probs:
@@ -1017,13 +1249,25 @@ class DataParallelPPOActor(BasePPOActor):
                             "position_ids": model_inputs["teacher_position_ids"],
                             "response_start_idx": model_inputs["teacher_response_start_idx"],
                         }
-                        if "teacher_multi_modal_inputs" in model_inputs:
+                        if use_visual_token_strategy:
+                            if "multi_modal_inputs" not in model_inputs:
+                                raise ValueError("same_image_bbox_mask requires student multi_modal_inputs")
+                            teacher_inputs["multi_modal_inputs"] = model_inputs["multi_modal_inputs"]
+                        elif "teacher_multi_modal_inputs" in model_inputs:
                             teacher_inputs["multi_modal_inputs"] = model_inputs["teacher_multi_modal_inputs"]
                         teacher_model = self.teacher_module or self.actor_module
                         if use_trust_region_teacher and (
                             self.teacher_module is None or self.teacher_module is self.actor_module
                         ):
                             raise ValueError("trust-region teacher requires a separate teacher_module in the actor worker.")
+                        if use_visual_token_strategy:
+                            teacher_inputs, selection_metrics = self._finalize_teacher_visual_token_mask(
+                                teacher_inputs,
+                                model_inputs.get("teacher_visual_token_selection_metadata"),
+                                student_image_embeds,
+                            )
+                            del student_image_embeds
+                            micro_batch_metrics.update(selection_metrics)
                         with torch.no_grad():
                             teacher_forward_start = time.perf_counter()
                             teacher_outputs = self._forward_micro_batch(
