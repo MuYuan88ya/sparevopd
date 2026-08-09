@@ -18,6 +18,7 @@ VisualTokenSelectionOutput = teacher_visual_token_mask.VisualTokenSelectionOutpu
 VisualTokenSelectionStrategy = teacher_visual_token_mask.VisualTokenSelectionStrategy
 apply_image_token_keep_mask = teacher_visual_token_mask.apply_image_token_keep_mask
 build_bbox_target_keep_mask = teacher_visual_token_mask.build_bbox_target_keep_mask
+build_visual_token_selection_state = teacher_visual_token_mask.build_visual_token_selection_state
 create_strategy = teacher_visual_token_mask.create_visual_token_selection_strategy
 register_strategy = teacher_visual_token_mask.register_visual_token_selection_strategy
 select_batched_visual_tokens = teacher_visual_token_mask.select_batched_visual_tokens
@@ -245,6 +246,48 @@ def test_batched_selection_rejects_flattened_embedding_mismatch():
             image_grid_thw=torch.tensor([[1, 4, 4], [1, 4, 6]]),
             target_keep_masks=[torch.zeros(4, dtype=torch.bool), torch.zeros(6, dtype=torch.bool)],
             sample_ids=[0, 1],
+        )
+
+
+def test_selection_state_contains_only_detached_per_sample_masks():
+    target_masks = [
+        torch.tensor([True, False, False, False]),
+        torch.tensor([False, True, False, False, False, False]),
+    ]
+    state = build_visual_token_selection_state(
+        strategy=create_strategy("fixed_stratified", {"background_keep_ratio": 0.0}),
+        image_embeds=torch.randn(10, 16),
+        image_grid_thw=torch.tensor([[1, 4, 4], [1, 4, 6]]),
+        target_keep_masks=target_masks,
+        sample_ids=["first", "second"],
+    )
+
+    assert set(state) == {"keep_masks", "target_keep_masks", "token_counts", "sample_ids", "metrics"}
+    assert "image_embeds" not in state
+    assert state["token_counts"] == [4, 6]
+    assert state["sample_ids"] == ["first", "second"]
+    for keep_mask, target_mask, original_target in zip(
+        state["keep_masks"], state["target_keep_masks"], target_masks, strict=True
+    ):
+        assert keep_mask.dtype == torch.bool and keep_mask.ndim == 1
+        assert target_mask.dtype == torch.bool and target_mask.ndim == 1
+        assert not keep_mask.requires_grad and not target_mask.requires_grad
+        assert torch.equal(target_mask, original_target)
+        assert torch.all(target_mask.to(keep_mask.device) <= keep_mask)
+
+
+def test_selection_state_rejects_strategy_target_drop():
+    class DropTargetStrategy(VisualTokenSelectionStrategy):
+        def select(self, selection_input):
+            return VisualTokenSelectionOutput(keep_mask=torch.zeros_like(selection_input.target_keep_mask))
+
+    with pytest.raises(ValueError, match="retain every target"):
+        build_visual_token_selection_state(
+            strategy=DropTargetStrategy(),
+            image_embeds=torch.randn(4, 8),
+            image_grid_thw=torch.tensor([[1, 4, 4]]),
+            target_keep_masks=[torch.tensor([True, False, False, False])],
+            sample_ids=[0],
         )
 
 

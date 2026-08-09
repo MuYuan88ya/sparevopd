@@ -5,7 +5,7 @@ import math
 from abc import ABC, abstractmethod
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, TypedDict
 
 import torch
 
@@ -22,6 +22,21 @@ class VisualTokenSelectionInput:
 class VisualTokenSelectionOutput:
     keep_mask: torch.Tensor
     metrics: dict[str, float] = field(default_factory=dict)
+
+
+class VisualTokenSelectionState(TypedDict):
+    """Per-micro-batch visual-token selection state shared by student and teacher.
+
+    The state deliberately contains masks and bookkeeping only.  Dense student
+    visual embeddings are consumed while the student forward is still active and
+    must never be retained here.
+    """
+
+    keep_masks: list[torch.BoolTensor]
+    target_keep_masks: list[torch.BoolTensor]
+    token_counts: list[int]
+    sample_ids: list[Any]
+    metrics: dict[str, float]
 
 
 class VisualTokenSelectionStrategy(ABC):
@@ -67,23 +82,36 @@ def create_visual_token_selection_strategy(
         raise ValueError(f"Invalid parameters for visual token selection strategy {name!r}: {exc}") from exc
 
 
-def _morton_code(row: int, col: int) -> int:
-    """Interleave row and column bits to preserve two-dimensional locality."""
-    code = 0
-    bit = 0
-    while row or col:
-        code |= (col & 1) << (2 * bit)
-        code |= (row & 1) << (2 * bit + 1)
-        row >>= 1
-        col >>= 1
-        bit += 1
-    return code
+_INT63_MASK = 0x7FFFFFFFFFFFFFFF
 
 
-def _stable_index(sample_id: Any, seed: int, stratum: int, size: int) -> int:
-    payload = f"{sample_id}|{seed}|{stratum}".encode()
+def _stable_sample_seed(sample_id: Any, seed: int) -> int:
+    payload = f"{sample_id}|{seed}".encode()
     digest = hashlib.blake2b(payload, digest_size=8).digest()
-    return int.from_bytes(digest, byteorder="little") % size
+    return int.from_bytes(digest, byteorder="little") & _INT63_MASK
+
+
+def _spread_morton_bits(values: torch.Tensor) -> torch.Tensor:
+    """Spread 16-bit coordinates into alternating bits using vectorized integer operations."""
+    values = values & 0xFFFF
+    values = (values | (values << 8)) & 0x00FF00FF
+    values = (values | (values << 4)) & 0x0F0F0F0F
+    values = (values | (values << 2)) & 0x33333333
+    return (values | (values << 1)) & 0x55555555
+
+
+def _morton_codes(rows: torch.Tensor, cols: torch.Tensor) -> torch.Tensor:
+    return _spread_morton_bits(cols) | (_spread_morton_bits(rows) << 1)
+
+
+def _stateless_stratum_hash(strata: torch.Tensor, sample_seed: int) -> torch.Tensor:
+    """Return deterministic non-negative int64 hashes on either CPU or GPU."""
+    values = (strata + sample_seed + 0x1E3779B97F4A7C15) & _INT63_MASK
+    values = values ^ (values >> 30)
+    values = (values * 0x3F58476D1CE4E5B9) & _INT63_MASK
+    values = values ^ (values >> 27)
+    values = (values * 0x14D049BB133111EB) & _INT63_MASK
+    return values ^ (values >> 31)
 
 
 def build_bbox_target_keep_mask(
@@ -93,6 +121,7 @@ def build_bbox_target_keep_mask(
     image_height: int,
     grid_height: int,
     grid_width: int,
+    device: torch.device | str | None = None,
 ) -> torch.Tensor:
     """Map a source-image bbox to a row-major merged visual-token grid."""
     if isinstance(bbox, torch.Tensor):
@@ -116,11 +145,9 @@ def build_bbox_target_keep_mask(
     row_start = min(grid_height - 1, math.floor(y1 * grid_height / image_height))
     row_end = min(grid_height, max(row_start + 1, math.ceil(y2 * grid_height / image_height)))
 
-    target_keep_mask = torch.zeros(grid_height * grid_width, dtype=torch.bool)
-    for row in range(row_start, row_end):
-        start = row * grid_width + col_start
-        target_keep_mask[start : start + (col_end - col_start)] = True
-    return target_keep_mask
+    target_keep_mask = torch.zeros((grid_height, grid_width), dtype=torch.bool, device=device)
+    target_keep_mask[row_start:row_end, col_start:col_end] = True
+    return target_keep_mask.flatten()
 
 
 def _validate_selection_input(selection_input: VisualTokenSelectionInput) -> tuple[int, int]:
@@ -247,6 +274,94 @@ def select_batched_visual_tokens(
     return outputs
 
 
+def build_visual_token_selection_state(
+    *,
+    strategy: VisualTokenSelectionStrategy,
+    image_embeds: torch.Tensor,
+    image_grid_thw: torch.Tensor,
+    target_keep_masks: list[torch.Tensor],
+    sample_ids: list[Any],
+) -> VisualTokenSelectionState:
+    """Select tokens once and materialize the compact state consumed by teacher.
+
+    ``image_embeds`` is intentionally not present in the returned object.  The
+    caller can therefore delete the dense embedding immediately after this
+    function returns without leaving a hidden reference in the teacher path.
+    """
+
+    selection_outputs = select_batched_visual_tokens(
+        strategy=strategy,
+        image_embeds=image_embeds,
+        image_grid_thw=image_grid_thw,
+        target_keep_masks=target_keep_masks,
+        sample_ids=sample_ids,
+    )
+    if len(selection_outputs) != len(target_keep_masks):
+        raise RuntimeError(
+            "visual token selection returned an unexpected number of samples, "
+            f"got outputs={len(selection_outputs)} and targets={len(target_keep_masks)}"
+        )
+
+    keep_masks: list[torch.Tensor] = []
+    normalized_target_masks: list[torch.Tensor] = []
+    token_counts: list[int] = []
+    metrics: dict[str, float] = {}
+    total_token_count = 0
+    for sample_idx, (target_keep_mask, selection_output) in enumerate(
+        zip(target_keep_masks, selection_outputs, strict=True)
+    ):
+        raw_target_keep_mask = target_keep_mask
+        raw_keep_mask = selection_output.keep_mask
+        if raw_target_keep_mask.dtype != torch.bool:
+            raise ValueError(f"target_keep_masks[{sample_idx}] must be a bool tensor")
+        if raw_keep_mask.dtype != torch.bool:
+            raise ValueError(f"selection keep_masks[{sample_idx}] must be a bool tensor")
+        if raw_target_keep_mask.ndim != 1 or raw_keep_mask.ndim != 1:
+            raise ValueError(f"selection masks[{sample_idx}] must be rank-1 tensors")
+        if raw_keep_mask.requires_grad or raw_target_keep_mask.requires_grad:
+            raise ValueError("visual token selection masks must not require gradients")
+        target_keep_mask = raw_target_keep_mask.detach()
+        keep_mask = raw_keep_mask.detach()
+        if keep_mask.numel() != target_keep_mask.numel():
+            raise ValueError(
+                f"selection masks[{sample_idx}] have mismatched lengths: "
+                f"keep={keep_mask.numel()} and target={target_keep_mask.numel()}"
+            )
+        target_on_keep_device = target_keep_mask.to(device=keep_mask.device)
+        if torch.any(target_on_keep_device & ~keep_mask):
+            raise ValueError(f"selection keep_masks[{sample_idx}] dropped a target token")
+        # Keep the masks detached and independent of strategy temporaries.  The
+        # target mask is small and kept on CPU to avoid retaining GPU storage.
+        keep_mask = keep_mask.to(dtype=torch.bool).clone()
+        target_keep_mask = target_keep_mask.to(device="cpu", dtype=torch.bool).clone()
+        keep_masks.append(keep_mask)
+        normalized_target_masks.append(target_keep_mask)
+        token_count = int(keep_mask.numel())
+        token_counts.append(token_count)
+        total_token_count += token_count
+        for key, value in selection_output.metrics.items():
+            metrics[key] = metrics.get(key, 0.0) + float(value)
+
+    if total_token_count != int(image_embeds.shape[0]):
+        raise RuntimeError(
+            "visual token selection state does not cover the dense embedding, "
+            f"got state tokens={total_token_count} and embeddings={image_embeds.shape[0]}"
+        )
+    if len(sample_ids) != len(keep_masks):
+        raise RuntimeError(
+            "visual token selection state sample ids are misaligned, "
+            f"got sample_ids={len(sample_ids)} and masks={len(keep_masks)}"
+        )
+
+    return VisualTokenSelectionState(
+        keep_masks=keep_masks,
+        target_keep_masks=normalized_target_masks,
+        token_counts=token_counts,
+        sample_ids=list(sample_ids),
+        metrics=metrics,
+    )
+
+
 @register_visual_token_selection_strategy("fixed_stratified")
 class FixedStratifiedVisualTokenSelectionStrategy(VisualTokenSelectionStrategy):
     def __init__(self, background_keep_ratio: float = 0.1, seed: int = 0) -> None:
@@ -257,14 +372,19 @@ class FixedStratifiedVisualTokenSelectionStrategy(VisualTokenSelectionStrategy):
 
     def select(self, selection_input: VisualTokenSelectionInput) -> VisualTokenSelectionOutput:
         grid_height, grid_width = _validate_selection_input(selection_input)
+        if grid_height > 0xFFFF or grid_width > 0xFFFF:
+            raise ValueError(
+                "fixed_stratified supports merged visual grids up to 65535x65535, "
+                f"got {(grid_height, grid_width)}"
+            )
         target_keep_mask = selection_input.target_keep_mask
-        background_coords = [
-            (row, col)
-            for row in range(grid_height)
-            for col in range(grid_width)
-            if not target_keep_mask[row * grid_width + col]
-        ]
-        background_token_count = len(background_coords)
+        if self.background_keep_ratio == 0.0:
+            return VisualTokenSelectionOutput(keep_mask=target_keep_mask.clone())
+        if self.background_keep_ratio == 1.0:
+            return VisualTokenSelectionOutput(keep_mask=torch.ones_like(target_keep_mask))
+
+        background_indices = torch.nonzero(~target_keep_mask, as_tuple=True)[0]
+        background_token_count = background_indices.numel()
         kept_background_token_count = (
             math.ceil(background_token_count * self.background_keep_ratio)
             if self.background_keep_ratio > 0.0
@@ -273,15 +393,37 @@ class FixedStratifiedVisualTokenSelectionStrategy(VisualTokenSelectionStrategy):
 
         keep_mask = target_keep_mask.clone()
         if kept_background_token_count:
-            ordered_background = sorted(background_coords, key=lambda coord: (_morton_code(*coord), *coord))
-            for stratum in range(kept_background_token_count):
-                start = stratum * background_token_count // kept_background_token_count
-                end = (stratum + 1) * background_token_count // kept_background_token_count
-                choices = ordered_background[start:end]
-                choice = choices[
-                    _stable_index(selection_input.sample_id, self.seed, stratum, len(choices))
-                ]
-                keep_mask[choice[0] * grid_width + choice[1]] = True
+            rows = torch.div(background_indices, grid_width, rounding_mode="floor")
+            cols = torch.remainder(background_indices, grid_width)
+            morton_codes = _morton_codes(rows, cols)
+            background_order = torch.argsort(morton_codes)
+            ordered_background = background_indices[background_order]
+            del rows, cols, morton_codes, background_order, background_indices
+
+            strata = torch.arange(
+                kept_background_token_count,
+                device=target_keep_mask.device,
+                dtype=torch.int64,
+            )
+            starts = torch.div(
+                strata * background_token_count,
+                kept_background_token_count,
+                rounding_mode="floor",
+            )
+            ends = torch.div(
+                (strata + 1) * background_token_count,
+                kept_background_token_count,
+                rounding_mode="floor",
+            )
+            offsets = torch.remainder(
+                _stateless_stratum_hash(
+                    strata,
+                    _stable_sample_seed(selection_input.sample_id, self.seed),
+                ),
+                ends - starts,
+            )
+            keep_mask.scatter_(0, ordered_background[starts + offsets], True)
+            del ordered_background, strata, starts, ends, offsets
 
         return VisualTokenSelectionOutput(keep_mask=keep_mask)
 

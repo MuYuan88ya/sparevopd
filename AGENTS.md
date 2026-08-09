@@ -39,14 +39,14 @@
 
 ## 学生视觉特征选择平台
 
-启用 `same_image_bbox_mask` 后，学生 forward 始终额外返回一份 detached 的 dense 合并视觉特征。actor 在学生 forward 完成后、教师 `unpad_input` 之前，将以下固定输入交给已注册的视觉 Token 选择策略：
+启用 `same_image_bbox_mask` 后，学生 forward 内部临时保留 detached 的 dense 合并视觉特征。actor 在学生 forward 返回前、教师 `unpad_input` 之前，将以下固定输入交给已注册的视觉 Token 选择策略；对外只返回 compact 的 selection state，不保存 dense embedding：
 
 - 学生的 dense `image_embeds`。
 - 每张图的 `image_grid_thw`。
 - bbox 映射得到的目标区域 mask。
 - 稳定的样本编号。
 
-策略返回最终 keep mask 和可选指标后，actor 才修改教师 `attention_mask`，然后执行教师 forward。这样未来可以注册相似度、多样性、聚类或可学习选择器，不需要再次调整教师 unpadding 和 LLM 输入路径。
+策略返回最终 keep mask 和可选指标后，dense embedding 立即释放。该 state 按当前 micro-batch 的样本顺序维护每张图的 keep mask、目标 mask、Token 数和 sample id；actor 用同一份 keep mask 修改教师 `attention_mask` 并写入教师多模态输入，然后执行教师 forward。这样未来可以注册相似度、多样性、聚类或可学习选择器，不需要再次调整教师 unpadding 和 LLM 输入路径。
 
 当前 `fixed_stratified` 策略按照 Morton 空间顺序分层并确定性抽样。学生 embedding 已经进入策略接口并完成形状与 batch 对齐检查，但当前策略不读取 embedding 数值进行排序。因此现阶段不能将方法描述为 embedding-similarity selection；这次改动建立的是后续特征选择实验所需的平台和正确时序。
 
