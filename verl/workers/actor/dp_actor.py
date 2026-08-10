@@ -39,10 +39,11 @@ from verl.utils.profiler import GPUMemoryLogger
 from verl.utils.py_functional import append_to_dict
 from verl.utils.seqlen_balancing import prepare_dynamic_batch, restore_dynamic_batch
 from verl.utils.teacher_visual_token_mask import (
+    VisualTokenSelectionRequest,
     VisualTokenSelectionState,
     apply_image_token_keep_mask,
     build_bbox_target_keep_mask,
-    build_visual_token_selection_state,
+    build_visual_token_selection_state_from_keep_mask,
     create_visual_token_selection_strategy,
 )
 from verl.utils.torch_dtypes import PrecisionType
@@ -133,6 +134,10 @@ class DataParallelPPOActor(BasePPOActor):
         ):
             if not self.use_remove_padding:
                 raise ValueError("same_image_bbox_mask requires actor.use_remove_padding=True")
+            if not bool(self_distillation_cfg.get("teacher_always_on", False)):
+                raise ValueError("same_image_bbox_mask requires self_distillation.teacher_always_on=True")
+            if self.use_ulysses_sp:
+                raise ValueError("same_image_bbox_mask does not support ulysses sequence parallelism")
             strategy_name = self_distillation_cfg.get(
                 "teacher_visual_token_selection_strategy", "fixed_stratified"
             )
@@ -353,16 +358,14 @@ class DataParallelPPOActor(BasePPOActor):
 
         return normalized_inputs, torch.cat(image_grids, dim=0), target_keep_masks, sample_ids
 
-    @torch.no_grad()
-    def _build_visual_token_selection_state(
+    def _build_visual_token_selection_request(
         self,
-        student_image_embeds: Optional[torch.Tensor],
         raw_multi_modal_inputs,
         selection_metadata,
         batch_size: int,
-    ) -> VisualTokenSelectionState:
-        if student_image_embeds is None:
-            raise ValueError("Student forward did not return dense image embeddings for teacher token selection")
+    ) -> tuple[VisualTokenSelectionRequest, torch.Tensor, list[torch.Tensor], list[Any]]:
+        """Build the ephemeral Student selection request before model forward."""
+
         if self.teacher_visual_token_selection_strategy is None:
             raise ValueError("Teacher visual token selection strategy was not initialized")
         _, image_grid_thw, target_keep_masks, sample_ids = self._prepare_visual_token_selection_inputs(
@@ -370,12 +373,31 @@ class DataParallelPPOActor(BasePPOActor):
             selection_metadata,
             batch_size,
         )
-        return build_visual_token_selection_state(
+        if not target_keep_masks:
+            raise ValueError("visual token selection requires at least one image")
+        target_keep_mask = torch.cat([mask.detach().to(dtype=torch.bool, device="cpu") for mask in target_keep_masks])
+        request = VisualTokenSelectionRequest(
             strategy=self.teacher_visual_token_selection_strategy,
-            image_embeds=student_image_embeds,
+            target_keep_mask=target_keep_mask,
+            sample_ids=tuple(sample_ids),
+            spatial_merge_size=self._get_actor_spatial_merge_size(),
+        )
+        return request, image_grid_thw, target_keep_masks, sample_ids
+
+    @torch.no_grad()
+    def _build_visual_token_selection_state_from_keep_mask(
+        self,
+        student_keep_mask: torch.Tensor,
+        image_grid_thw: torch.Tensor,
+        target_keep_masks: list[torch.Tensor],
+        sample_ids: list[Any],
+    ) -> VisualTokenSelectionState:
+        return build_visual_token_selection_state_from_keep_mask(
+            keep_mask=student_keep_mask,
             image_grid_thw=image_grid_thw,
             target_keep_masks=target_keep_masks,
             sample_ids=sample_ids,
+            spatial_merge_size=self._get_actor_spatial_merge_size(),
         )
 
     @torch.no_grad()
@@ -647,7 +669,7 @@ class DataParallelPPOActor(BasePPOActor):
                     topk_indices: (bs, response_len, k)
                 if return_visual_token_selection is True:
                     visual_token_selection: compact per-sample keep-mask state;
-                        dense student embedding is released
+                        no dense student embedding is returned
         """
         calculate_sum_pi_squared = self.config.get("calculate_sum_pi_squared", False)
         sum_pi_squared_checkpointing = self.config.get("sum_pi_squared_checkpointing", False)
@@ -683,6 +705,8 @@ class DataParallelPPOActor(BasePPOActor):
                 )
 
         response_length = micro_batch["responses"].size(-1)
+        input_ids = micro_batch["input_ids"]
+        batch_size, seqlen = input_ids.shape
         raw_multi_modal_inputs = micro_batch.get("multi_modal_inputs")
         multi_modal_inputs = {}
         if "multi_modal_inputs" in micro_batch.keys():
@@ -690,9 +714,23 @@ class DataParallelPPOActor(BasePPOActor):
 
             multi_modal_inputs = extract_multi_modal_inputs(micro_batch["multi_modal_inputs"])
 
+        visual_token_selection_request = None
+        selection_image_grid_thw = None
+        selection_target_keep_masks = None
+        selection_sample_ids = None
+        if return_visual_token_selection:
+            (
+                visual_token_selection_request,
+                selection_image_grid_thw,
+                selection_target_keep_masks,
+                selection_sample_ids,
+            ) = self._build_visual_token_selection_request(
+                raw_multi_modal_inputs,
+                micro_batch.get("teacher_visual_token_selection_metadata"),
+                batch_size,
+            )
+
         with torch.autocast(device_type=self.device_name, dtype=self.param_dtype):
-            input_ids = micro_batch["input_ids"]
-            batch_size, seqlen = input_ids.shape
             attention_mask = micro_batch["attention_mask"]
             position_ids = micro_batch["position_ids"]
             response_start_idx = micro_batch.get("response_start_idx")
@@ -703,7 +741,6 @@ class DataParallelPPOActor(BasePPOActor):
                         f"response_start_idx shape must be ({batch_size},), got {tuple(response_start_idx.shape)}"
                     )
             entropy = None
-            model_image_embeds = None
             visual_token_selection_state = None
             if position_ids.dim() == 3:  # qwen2vl mrope
                 position_ids = position_ids.transpose(0, 1)  # (bsz, 4, seqlen) -> (4, bsz, seqlen)
@@ -789,7 +826,7 @@ class DataParallelPPOActor(BasePPOActor):
                     extra_args["temperature"] = temperature
                     extra_args["return_dict"] = True
                 if return_visual_token_selection:
-                    extra_args["return_image_embeds"] = True
+                    extra_args["visual_token_selection_request"] = visual_token_selection_request
 
                 output = model(
                     input_ids=input_ids_rmpad,
@@ -799,19 +836,16 @@ class DataParallelPPOActor(BasePPOActor):
                     use_cache=False,
                     **extra_args,
                 )  # prevent model thinks we are generating
-                model_image_embeds = getattr(output, "image_embeds", None)
                 if return_visual_token_selection:
-                    visual_token_selection_state = self._build_visual_token_selection_state(
-                        model_image_embeds,
-                        raw_multi_modal_inputs,
-                        micro_batch.get("teacher_visual_token_selection_metadata"),
-                        batch_size,
+                    student_keep_mask = getattr(output, "visual_token_keep_mask", None)
+                    if student_keep_mask is None:
+                        raise ValueError("Model did not return visual_token_keep_mask for visual token selection")
+                    visual_token_selection_state = self._build_visual_token_selection_state_from_keep_mask(
+                        student_keep_mask,
+                        selection_image_grid_thw,
+                        selection_target_keep_masks,
+                        selection_sample_ids,
                     )
-                    # The model output keeps a reference to the detached dense
-                    # embedding.  Clear it as soon as the compact state exists.
-                    if hasattr(output, "image_embeds"):
-                        output.image_embeds = None
-                    del model_image_embeds
 
                 if self.use_fused_kernels:
                     log_probs = output.log_probs.squeeze(0)  # (total_nnz,)
@@ -1018,7 +1052,7 @@ class DataParallelPPOActor(BasePPOActor):
                     extra_args["temperature"] = temperature
                     extra_args["return_dict"] = True
                 if return_visual_token_selection:
-                    extra_args["return_image_embeds"] = True
+                    extra_args["visual_token_selection_request"] = visual_token_selection_request
 
                 output = model(
                     input_ids=input_ids,
@@ -1028,17 +1062,16 @@ class DataParallelPPOActor(BasePPOActor):
                     use_cache=False,
                     **extra_args,
                 )  # prevent model thinks we are generating
-                model_image_embeds = getattr(output, "image_embeds", None)
                 if return_visual_token_selection:
-                    visual_token_selection_state = self._build_visual_token_selection_state(
-                        model_image_embeds,
-                        raw_multi_modal_inputs,
-                        micro_batch.get("teacher_visual_token_selection_metadata"),
-                        batch_size,
+                    student_keep_mask = getattr(output, "visual_token_keep_mask", None)
+                    if student_keep_mask is None:
+                        raise ValueError("Model did not return visual_token_keep_mask for visual token selection")
+                    visual_token_selection_state = self._build_visual_token_selection_state_from_keep_mask(
+                        student_keep_mask,
+                        selection_image_grid_thw,
+                        selection_target_keep_masks,
+                        selection_sample_ids,
                     )
-                    if hasattr(output, "image_embeds"):
-                        output.image_embeds = None
-                    del model_image_embeds
 
                 if self.use_fused_kernels:
                     log_probs = output.log_probs[:, -response_length - 1 : -1]
@@ -1090,7 +1123,7 @@ class DataParallelPPOActor(BasePPOActor):
                     outputs["topk_indices"] = topk_indices
             if return_visual_token_selection:
                 if visual_token_selection_state is None:
-                    raise ValueError("Model did not return image_embeds for visual token selection")
+                    raise ValueError("Model did not return visual token selection state")
                 outputs["visual_token_selection"] = visual_token_selection_state
             return outputs
 
@@ -1229,7 +1262,9 @@ class DataParallelPPOActor(BasePPOActor):
                 "teacher_response_start_idx",
                 "self_distillation_mask",
             }
-            assert self_distillation_required_keys.issubset(set(data.batch.keys())), f"Missing required keys: {self_distillation_required_keys - set(data.batch.keys())}"
+            assert self_distillation_required_keys.issubset(set(data.batch.keys())), (
+                f"Missing required keys: {self_distillation_required_keys - set(data.batch.keys())}"
+            )
 
         select_keys = [
             "responses",
@@ -1324,7 +1359,9 @@ class DataParallelPPOActor(BasePPOActor):
                     loss_agg_mode = self.config.loss_agg_mode
 
                     calculate_entropy = self.config.calculate_entropy or (entropy_coeff != 0)
-                    self_distillation_mask = model_inputs.get("self_distillation_mask") if self_distillation_enabled else None
+                    self_distillation_mask = (
+                        model_inputs.get("self_distillation_mask") if self_distillation_enabled else None
+                    )
                     policy_fallback_mask = None
                     if self_distillation_enabled and self_distillation_mask is not None:
                         policy_fallback_mask = (self_distillation_mask <= 0.5).to(response_mask.dtype)
@@ -1339,12 +1376,21 @@ class DataParallelPPOActor(BasePPOActor):
 
                     teacher_regularization = self_distillation_cfg.get("teacher_regularization", "ema")
                     teacher_model_source = self_distillation_cfg.get("teacher_model_source", "legacy")
-                    use_trust_region_teacher = teacher_model_source == "legacy" and teacher_regularization == "trust-region"
+                    use_trust_region_teacher = (
+                        teacher_model_source == "legacy" and teacher_regularization == "trust-region"
+                    )
                     if use_trust_region_teacher and self.use_fused_kernels:
                         raise ValueError("trust-region teacher requires disabling fused kernels to access logits.")
                     # all return: (bsz, response_length)
-                    return_all_logps = self_distillation_cfg.full_logit_distillation and not self_distillation_cfg.distillation_topk
-                    distill_topk = self_distillation_cfg.distillation_topk if self_distillation_cfg.full_logit_distillation else None
+                    return_all_logps = (
+                        self_distillation_cfg.full_logit_distillation
+                        and not self_distillation_cfg.distillation_topk
+                    )
+                    distill_topk = (
+                        self_distillation_cfg.distillation_topk
+                        if self_distillation_cfg.full_logit_distillation
+                        else None
+                    )
                     use_visual_token_strategy = bool(
                         self_distillation_enabled
                         and self_distillation_cfg.get("teacher_visual_token_mode", "crop")
@@ -1402,7 +1448,9 @@ class DataParallelPPOActor(BasePPOActor):
                         if use_trust_region_teacher and (
                             self.teacher_module is None or self.teacher_module is self.actor_module
                         ):
-                            raise ValueError("trust-region teacher requires a separate teacher_module in the actor worker.")
+                            raise ValueError(
+                                "trust-region teacher requires a separate teacher_module in the actor worker."
+                            )
                         if use_visual_token_strategy:
                             teacher_inputs, selection_metrics = self._finalize_teacher_visual_token_mask(
                                 teacher_inputs,
@@ -1446,8 +1494,14 @@ class DataParallelPPOActor(BasePPOActor):
                             if valid_rows.any():
                                 distill_dump_chunks.append(
                                     {
-                                        "student_log_probs": student_distill_log_probs[valid_rows].detach().cpu().to(torch.float32),
-                                        "teacher_log_probs": teacher_distill_log_probs[valid_rows].detach().cpu().to(torch.float32),
+                                        "student_log_probs": student_distill_log_probs[valid_rows]
+                                        .detach()
+                                        .cpu()
+                                        .to(torch.float32),
+                                        "teacher_log_probs": teacher_distill_log_probs[valid_rows]
+                                        .detach()
+                                        .cpu()
+                                        .to(torch.float32),
                                     }
                                 )
                         loss_compute_start = time.perf_counter()
@@ -1491,7 +1545,10 @@ class DataParallelPPOActor(BasePPOActor):
                             )
                             pg_loss = vopd_loss + grpo_loss
                             micro_batch_metrics.update(
-                                {f"actor/policy_fallback/{key.split('/', 1)[1]}": value for key, value in grpo_metrics.items()}
+                                {
+                                    f"actor/policy_fallback/{key.split('/', 1)[1]}": value
+                                    for key, value in grpo_metrics.items()
+                                }
                             )
                         else:
                             grpo_loss = None
@@ -1595,7 +1652,9 @@ class DataParallelPPOActor(BasePPOActor):
         if self_distillation_enabled:
             for key, total_time in stage_wall_time_totals.items():
                 metrics[key] = Metric(aggregation=AggregationType.MAX, value=total_time)
-        metric_keys_to_keep_unreduced = set(stage_wall_time_totals.keys()) if stage_wall_time_totals is not None else set()
+        metric_keys_to_keep_unreduced = (
+            set(stage_wall_time_totals.keys()) if stage_wall_time_totals is not None else set()
+        )
         local_metrics_to_reduce = {
             key: value
             for key, value in metrics.items()

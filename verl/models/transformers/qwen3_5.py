@@ -23,6 +23,11 @@ from transformers.models.qwen3_5.modeling_qwen3_5 import (
     Qwen3_5ForConditionalGeneration,
 )
 
+from verl.utils.teacher_visual_token_mask import (
+    VisualTokenSelectionRequest,
+    select_visual_tokens_from_request,
+)
+
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 
@@ -100,15 +105,23 @@ def _get_input_embeds(
     image_grid_thw: Optional[torch.LongTensor] = None,
     video_grid_thw: Optional[torch.LongTensor] = None,
     image_token_keep_mask: Optional[torch.BoolTensor] = None,
-    return_image_embeds: bool = False,
+    visual_token_selection_request: Optional[VisualTokenSelectionRequest] = None,
 ):
     inputs_embeds = model.get_input_embeddings()(input_ids)
-    dense_image_embeds = None
+    visual_token_keep_mask = None
     if pixel_values is not None:
         pixel_values = pixel_values.type(model.visual.dtype)
         dense_image_embeds = model.visual(pixel_values, grid_thw=image_grid_thw).pooler_output
+
+        image_mask = input_ids == model.config.image_token_id
+        if image_mask.ndim != 2:
+            raise ValueError(f"input_ids must have shape [batch, sequence], got {tuple(input_ids.shape)}")
+        image_token_count = int(image_mask.sum().item())
+
         image_embeds = dense_image_embeds
         if image_token_keep_mask is not None:
+            if visual_token_selection_request is not None:
+                raise ValueError("student visual-token selection and teacher keep mask cannot be enabled together")
             image_token_keep_mask = image_token_keep_mask.to(device=image_embeds.device, dtype=torch.bool).flatten()
             if image_token_keep_mask.numel() != image_embeds.shape[0]:
                 raise ValueError(
@@ -116,20 +129,35 @@ def _get_input_embeds(
                     f"mask: {image_token_keep_mask.numel()}, features: {image_embeds.shape[0]}"
                 )
             image_embeds = image_embeds[image_token_keep_mask]
-        n_image_tokens = (input_ids == model.config.image_token_id).sum().item()
+            if int(image_token_keep_mask.sum().item()) != image_token_count:
+                raise ValueError(
+                    "Teacher image attention mask and image token keep mask do not match: "
+                    f"active placeholders: {image_token_count}, kept features: "
+                    f"{int(image_token_keep_mask.sum().item())}"
+                )
+
         n_image_features = image_embeds.shape[0]
-        if n_image_tokens != n_image_features:
+        if image_token_count != n_image_features:
             raise ValueError(
-                f"Image features and image tokens do not match: tokens: {n_image_tokens}, features {n_image_features}"
+                f"Image features and image tokens do not match: tokens: {image_token_count}, "
+                f"features {n_image_features}"
             )
 
-        mask = input_ids == model.config.image_token_id
-        mask_unsqueezed = mask.unsqueeze(-1)
-        mask_expanded = mask_unsqueezed.expand_as(inputs_embeds)
-        image_mask = mask_expanded.to(inputs_embeds.device)
-
         image_embeds = image_embeds.to(inputs_embeds.device, inputs_embeds.dtype)
-        inputs_embeds = inputs_embeds.masked_scatter(image_mask, image_embeds)
+        image_mask = image_mask.to(inputs_embeds.device, dtype=torch.bool)
+        image_mask_expanded = image_mask.unsqueeze(-1).expand_as(inputs_embeds)
+        inputs_embeds = inputs_embeds.masked_scatter(image_mask_expanded, image_embeds)
+
+        if visual_token_selection_request is not None:
+            visual_token_keep_mask = select_visual_tokens_from_request(
+                request=visual_token_selection_request,
+                image_embeds=dense_image_embeds.detach(),
+                inputs_embeds=inputs_embeds.detach(),
+                image_mask=image_mask.detach(),
+                image_grid_thw=image_grid_thw,
+            ).keep_mask
+    elif visual_token_selection_request is not None:
+        raise ValueError("visual token selection requires real image pixel_values")
 
     if pixel_values_videos is not None:
         pixel_values_videos = pixel_values_videos.type(model.visual.dtype)
@@ -160,11 +188,11 @@ def _get_input_embeds(
     if attention_mask is not None:
         attention_mask = attention_mask.to(inputs_embeds.device)
 
-    output = {"inputs_embeds": inputs_embeds, "attention_mask": attention_mask}
-    if return_image_embeds:
-        if dense_image_embeds is None:
-            raise ValueError("return_image_embeds=True requires real image pixel_values")
-        output["image_embeds"] = dense_image_embeds.detach()
+    output = {
+        "inputs_embeds": inputs_embeds,
+        "attention_mask": attention_mask,
+        "visual_token_keep_mask": visual_token_keep_mask,
+    }
     return output
 
 
@@ -177,7 +205,7 @@ def qwen3_5_base_forward(
     image_grid_thw: Optional[torch.LongTensor] = None,
     video_grid_thw: Optional[torch.LongTensor] = None,
     image_token_keep_mask: Optional[torch.BoolTensor] = None,
-    return_image_embeds: bool = False,
+    visual_token_selection_request: Optional[VisualTokenSelectionRequest] = None,
     **kwargs,
 ):
     input_kwargs = _get_input_embeds(
@@ -189,16 +217,16 @@ def qwen3_5_base_forward(
         image_grid_thw,
         video_grid_thw,
         image_token_keep_mask,
-        return_image_embeds,
+        visual_token_selection_request,
     )
-    image_embeds = input_kwargs.pop("image_embeds", None)
+    visual_token_keep_mask = input_kwargs.pop("visual_token_keep_mask", None)
     kwargs.update(input_kwargs)
     outputs = self.language_model(
         input_ids=None,
         **kwargs,
     )
-    if image_embeds is not None:
-        outputs.image_embeds = image_embeds
+    if visual_token_keep_mask is not None:
+        outputs.visual_token_keep_mask = visual_token_keep_mask
     return outputs
 
 
@@ -206,7 +234,7 @@ def qwen3_5_base_forward(
 class Qwen3_5CausalLMOutputForPPO(Qwen3_5CausalLMOutputWithPast):
     log_probs: Optional[torch.FloatTensor] = None
     entropy: Optional[torch.FloatTensor] = None
-    image_embeds: Optional[torch.FloatTensor] = None
+    visual_token_keep_mask: Optional[torch.BoolTensor] = None
 
 
 def forward_with_normal_backend(
@@ -222,7 +250,7 @@ def forward_with_normal_backend(
     return Qwen3_5CausalLMOutputForPPO(
         logits=logits,
         hidden_states=outputs.hidden_states,
-        image_embeds=getattr(outputs, "image_embeds", None),
+        visual_token_keep_mask=getattr(outputs, "visual_token_keep_mask", None),
     )
 
 
@@ -256,7 +284,7 @@ def forward_with_torch_backend(
         log_probs=log_probs,
         entropy=entropy,
         hidden_states=outputs.hidden_states,
-        image_embeds=getattr(outputs, "image_embeds", None),
+        visual_token_keep_mask=getattr(outputs, "visual_token_keep_mask", None),
     )
 
 
@@ -290,5 +318,5 @@ def forward_with_triton_backend(
         log_probs=log_probs,
         entropy=entropy,
         hidden_states=outputs.hidden_states,
-        image_embeds=getattr(outputs, "image_embeds", None),
+        visual_token_keep_mask=getattr(outputs, "visual_token_keep_mask", None),
     )

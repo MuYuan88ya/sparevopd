@@ -148,7 +148,7 @@ self_distillation:
   # Dataset column containing [x1, y1, x2, y2] in source-image coordinates
   teacher_bbox_key: bbox
 
-  # Registered strategy that selects merged visual tokens after the student forward
+  # Registered strategy that selects merged visual tokens inside the student embedding path
   teacher_visual_token_selection_strategy: fixed_stratified
 
   # Keyword arguments passed directly to the registered strategy

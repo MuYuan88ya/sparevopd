@@ -15,13 +15,18 @@ SPEC.loader.exec_module(teacher_visual_token_mask)
 
 VisualTokenSelectionInput = teacher_visual_token_mask.VisualTokenSelectionInput
 VisualTokenSelectionOutput = teacher_visual_token_mask.VisualTokenSelectionOutput
+VisualTokenSelectionRequest = teacher_visual_token_mask.VisualTokenSelectionRequest
 VisualTokenSelectionStrategy = teacher_visual_token_mask.VisualTokenSelectionStrategy
 apply_image_token_keep_mask = teacher_visual_token_mask.apply_image_token_keep_mask
 build_bbox_target_keep_mask = teacher_visual_token_mask.build_bbox_target_keep_mask
 build_visual_token_selection_state = teacher_visual_token_mask.build_visual_token_selection_state
+build_visual_token_selection_state_from_keep_mask = (
+    teacher_visual_token_mask.build_visual_token_selection_state_from_keep_mask
+)
 create_strategy = teacher_visual_token_mask.create_visual_token_selection_strategy
 register_strategy = teacher_visual_token_mask.register_visual_token_selection_strategy
 select_batched_visual_tokens = teacher_visual_token_mask.select_batched_visual_tokens
+select_visual_tokens_from_request = teacher_visual_token_mask.select_visual_tokens_from_request
 select_visual_tokens = teacher_visual_token_mask.select_visual_tokens
 
 
@@ -53,6 +58,46 @@ def test_strategy_registry_factory_and_duplicate_registration():
 
     with pytest.raises(ValueError, match="already registered"):
         register_strategy("test_registry_strategy")(TestStrategy)
+
+
+def test_batch_strategy_receives_dense_context_and_compact_image_mask():
+    observed = {}
+
+    class RecordingStrategy(VisualTokenSelectionStrategy):
+        def select(self, selection_input):
+            observed["inputs_embeds"] = selection_input.inputs_embeds
+            observed["image_mask"] = selection_input.image_mask
+            observed["image_grid_thw"] = selection_input.image_grid_thw
+            observed["sample_ids"] = selection_input.sample_ids
+            return VisualTokenSelectionOutput(keep_mask=selection_input.target_keep_mask.clone())
+
+    target_keep_mask = torch.tensor(
+        [True, False, False, False, False, True, False, False, False, False],
+        dtype=torch.bool,
+    )
+    image_mask = torch.zeros((1, 18), dtype=torch.bool)
+    image_mask[0, [1, 2, 3, 4, 8, 9, 10, 11, 12, 13]] = True
+    request = VisualTokenSelectionRequest(
+        strategy=RecordingStrategy(),
+        target_keep_mask=target_keep_mask,
+        sample_ids=("first", "second"),
+        spatial_merge_size=2,
+    )
+
+    output = select_visual_tokens_from_request(
+        request=request,
+        image_embeds=torch.randn(10, 8),
+        inputs_embeds=torch.randn(1, 18, 8),
+        image_mask=image_mask,
+        image_grid_thw=torch.tensor([[1, 4, 4], [1, 4, 6]]),
+    )
+
+    assert torch.equal(output.keep_mask, target_keep_mask)
+    assert observed["inputs_embeds"].shape == (1, 18, 8)
+    assert observed["image_mask"].shape == (1, 18)
+    assert observed["image_mask"].dtype == torch.bool
+    assert observed["image_grid_thw"].shape == (2, 3)
+    assert observed["sample_ids"] == ("first", "second")
 
 
 def test_factory_rejects_unknown_strategy_and_parameters():
@@ -274,6 +319,26 @@ def test_selection_state_contains_only_detached_per_sample_masks():
         assert not keep_mask.requires_grad and not target_mask.requires_grad
         assert torch.equal(target_mask, original_target)
         assert torch.all(target_mask.to(keep_mask.device) <= keep_mask)
+
+
+def test_selection_state_can_be_built_from_model_keep_mask_without_embeddings():
+    target_masks = [
+        torch.tensor([True, False, False, False]),
+        torch.tensor([False, True, False, False, False, False]),
+    ]
+    state = build_visual_token_selection_state_from_keep_mask(
+        keep_mask=torch.tensor(
+            [True, False, False, False, False, True, False, False, False, False],
+            dtype=torch.bool,
+        ),
+        image_grid_thw=torch.tensor([[1, 4, 4], [1, 4, 6]]),
+        target_keep_masks=target_masks,
+        sample_ids=["first", "second"],
+        spatial_merge_size=2,
+    )
+    assert state["token_counts"] == [4, 6]
+    assert [int(mask.sum()) for mask in state["keep_masks"]] == [1, 1]
+    assert "image_embeds" not in state
 
 
 def test_selection_state_rejects_strategy_target_drop():
