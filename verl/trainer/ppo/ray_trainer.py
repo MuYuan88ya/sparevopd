@@ -1166,7 +1166,6 @@ class RayPPOTrainer:
                 f"and response length {responses.shape[1]}"
             )
 
-        merge_size = int(self.processor.image_processor.merge_size)
         teacher_attention_mask = attention_mask.clone()
         selection_metadata = []
 
@@ -1177,34 +1176,8 @@ class RayPPOTrainer:
                 batch,
                 sample_idx,
             )
-            multi_modal_inputs = batch.non_tensor_batch["multi_modal_inputs"][sample_idx]
-            multi_modal_inputs = getattr(multi_modal_inputs, "data", multi_modal_inputs)
-            if not isinstance(multi_modal_inputs, dict):
-                raise TypeError(
-                    f"multi_modal_inputs must be a dict for sample {sample_idx}, got {type(multi_modal_inputs)}"
-                )
-            image_grid_thw = multi_modal_inputs.get("image_grid_thw")
-            if image_grid_thw is None or image_grid_thw.ndim != 2 or image_grid_thw.shape != (1, 3):
-                shape = None if image_grid_thw is None else tuple(image_grid_thw.shape)
-                raise ValueError(
-                    "same_image_bbox_mask supports exactly one image per sample; "
-                    f"sample {sample_idx} has image_grid_thw={shape}"
-                )
-
-            grid_t, patch_grid_height, patch_grid_width = (int(value) for value in image_grid_thw[0].tolist())
-            if grid_t != 1:
-                raise ValueError(f"same_image_bbox_mask supports still images only, got grid_t={grid_t}")
-            if patch_grid_height % merge_size or patch_grid_width % merge_size:
-                raise ValueError(
-                    f"image grid {(patch_grid_height, patch_grid_width)} is not divisible by merge size {merge_size}"
-                )
-
             image_width = int(batch.non_tensor_batch["image_width"][sample_idx])
             image_height = int(batch.non_tensor_batch["image_height"][sample_idx])
-            if image_width <= 0 or image_height <= 0:
-                raise ValueError(
-                    f"same_image_bbox_mask requires positive image dimensions, got {(image_width, image_height)}"
-                )
             selection_metadata.append(
                 {
                     "bbox": batch.non_tensor_batch[bbox_key][sample_idx],

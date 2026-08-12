@@ -39,15 +39,15 @@
 
 ## 学生视觉特征选择平台
 
-启用 `same_image_bbox_mask` 后，actor 在每次 `_forward_micro_batch` 调用模型前，根据 bbox、原图尺寸和 `image_grid_thw` 生成目标区域 mask，并创建只存在于当前调用栈的 `VisualTokenSelectionRequest`。请求传给 Qwen3.5 的 `_get_input_embeds`，由模型在完成 ViT 和学生 dense 多模态 embedding 注入后立即调用已注册策略：
+启用 `same_image_bbox_mask` 后，actor 在每次学生 `_forward_micro_batch` 前创建只使用一次的 `VisualTokenSelectionSession`。Qwen3.5 在完成 ViT 和学生 dense 多模态 embedding 注入后执行该 session；session 统一完成 batch 切分、bbox 目标 mask 构造、输入校验和已注册策略调用：
 
 - 学生的 dense `image_embeds`。
 - 学生完整的 `inputs_embeds` 和紧凑的 `image_mask`。
-- 整个 micro-batch 的 `image_grid_thw`、扁平目标 mask、稳定样本编号和空间合并尺寸。
+- 整个 micro-batch 的 `image_grid_thw`、bbox 元数据、有效序列长度、稳定样本编号和空间合并尺寸。
 
-策略只返回最终 keep mask，不返回 selected embedding。学生仍将完整视觉 embedding 注入自己的 LLM；模型输出只携带 detached 的 bool keep mask。actor 按当前 micro-batch 的样本顺序切分并保存 compact selection state，不保存 dense embedding。
+策略子类只处理单样本并返回最终 keep mask，不返回 selected embedding。学生仍将完整视觉 embedding 注入自己的 LLM；Qwen 的模型输出结构不携带选择结果。session 立即将策略输出转换成按 micro-batch 顺序排列的 detached bool mask，并释放所有 dense 输入引用。
 
-随后 actor 用同一份 state 修改教师 `attention_mask` 并写入教师多模态输入。教师 forward 仍在 actor 中先经过现有 `unpad_input`，再由 Qwen3.5 重新完成全图 ViT forward，并用 `image_token_keep_mask` 筛选进入教师 LLM 的视觉特征。这样策略只负责选择，attention-mask/unpadding 和视觉特征对齐仍各自只有一条实现路径。
+随后 actor 直接读取 session 的 compact result，用同一份 mask 修改教师 `attention_mask` 并写入教师多模态输入。教师 forward 仍在 actor 中先经过现有 `unpad_input`，再由 Qwen3.5 重新完成全图 ViT forward，并用 `image_token_keep_mask` 筛选进入教师 LLM 的视觉特征。这样策略只负责单样本选择，batch 对齐、attention-mask/unpadding 和视觉特征过滤各自只有一条实现路径。
 
 当前 `fixed_stratified` 策略按照 Morton 空间顺序分层并确定性抽样。学生 embedding 已经进入策略接口并完成形状与 batch 对齐检查，但当前策略不读取 embedding 数值进行排序。因此现阶段不能将方法描述为 embedding-similarity selection；这次改动建立的是后续特征选择实验所需的平台和正确时序。
 

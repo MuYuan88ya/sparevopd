@@ -3,77 +3,190 @@ from __future__ import annotations
 import hashlib
 import math
 from abc import ABC, abstractmethod
-from collections.abc import Callable, Mapping
-from dataclasses import dataclass, field
-from typing import Any, Optional, TypedDict
+from collections.abc import Callable, Mapping, Sequence
+from dataclasses import dataclass
+from typing import Any
 
 import torch
 
 
 @dataclass(frozen=True)
-class VisualTokenSelectionInput:
-    """Inputs supplied to a visual-token selection strategy.
-
-    The current strategy path is batch-oriented: ``image_embeds`` and
-    ``target_keep_mask`` are flattened in image order, while ``image_grid_thw``
-    describes each image.  ``inputs_embeds`` and ``image_mask`` are the full
-    model-call tensors (after visual features have been injected for the
-    student).  The optional ``sample_id`` field keeps the old one-image helper
-    API source compatible for downstream strategies and tests.
-    """
+class VisualTokenSelectionBatch:
+    """Dense Student context available only while a selection session runs."""
 
     image_embeds: torch.Tensor
+    inputs_embeds: torch.Tensor
+    image_mask: torch.BoolTensor
     image_grid_thw: torch.Tensor
-    target_keep_mask: torch.Tensor
-    sample_id: Any = None
-    inputs_embeds: Optional[torch.Tensor] = None
-    image_mask: Optional[torch.Tensor] = None
-    sample_ids: Optional[tuple[Any, ...]] = None
-    spatial_merge_size: Optional[int] = None
+    valid_sequence_lengths: tuple[int, ...]
+    metadata: tuple[Mapping[str, Any], ...]
+    spatial_merge_size: int
 
 
 @dataclass(frozen=True)
-class VisualTokenSelectionOutput:
-    keep_mask: torch.Tensor
-    # Kept as an optional compatibility field.  New strategies should return
-    # only ``keep_mask``; metrics are now computed by the actor from masks.
-    metrics: dict[str, float] = field(default_factory=dict)
+class VisualTokenSelectionSample:
+    """One image and its aligned multimodal Student context."""
+
+    image_embeds: torch.Tensor
+    inputs_embeds: torch.Tensor
+    image_mask: torch.BoolTensor
+    image_grid_thw: torch.Tensor
+    target_keep_mask: torch.BoolTensor
+    sample_id: Any
+    grid_height: int
+    grid_width: int
 
 
-class VisualTokenSelectionState(TypedDict):
-    """Per-micro-batch visual-token selection state shared by student and teacher.
+@dataclass(frozen=True)
+class VisualTokenSelectionResult:
+    """Compact selection result retained between Student and Teacher forwards."""
 
-    The state deliberately contains masks and bookkeeping only.  Dense student
-    visual embeddings are consumed while the student forward is still active and
-    must never be retained here.
-    """
-
-    keep_masks: list[torch.BoolTensor]
-    target_keep_masks: list[torch.BoolTensor]
-    token_counts: list[int]
-    sample_ids: list[Any]
+    keep_masks: tuple[torch.BoolTensor, ...]
+    target_keep_masks: tuple[torch.BoolTensor, ...]
+    sample_ids: tuple[Any, ...]
     metrics: dict[str, float]
+
+    def __post_init__(self) -> None:
+        sample_count = len(self.keep_masks)
+        if len(self.target_keep_masks) != sample_count or len(self.sample_ids) != sample_count:
+            raise ValueError("Visual token selection result fields must have the same sample count")
+        for sample_idx, (keep_mask, target_keep_mask) in enumerate(
+            zip(self.keep_masks, self.target_keep_masks, strict=True)
+        ):
+            if not isinstance(keep_mask, torch.Tensor) or not isinstance(target_keep_mask, torch.Tensor):
+                raise TypeError(f"selection masks[{sample_idx}] must be torch tensors")
+            if keep_mask.ndim != 1 or keep_mask.dtype != torch.bool:
+                raise ValueError(f"keep_masks[{sample_idx}] must be a rank-1 bool tensor")
+            if target_keep_mask.ndim != 1 or target_keep_mask.dtype != torch.bool:
+                raise ValueError(f"target_keep_masks[{sample_idx}] must be a rank-1 bool tensor")
+            if keep_mask.shape != target_keep_mask.shape:
+                raise ValueError(f"selection masks[{sample_idx}] must have the same shape")
+            if keep_mask.requires_grad or target_keep_mask.requires_grad:
+                raise ValueError("visual token selection masks must not require gradients")
+            if torch.any(target_keep_mask.to(device=keep_mask.device) & ~keep_mask):
+                raise ValueError(f"keep_masks[{sample_idx}] dropped a target token")
+
+    def __len__(self) -> int:
+        return len(self.keep_masks)
 
 
 class VisualTokenSelectionStrategy(ABC):
+    """Base class that owns batching, alignment, and output validation."""
+
     @abstractmethod
-    def select(self, selection_input: VisualTokenSelectionInput) -> VisualTokenSelectionOutput:
-        """Select the merged visual tokens that remain visible to the teacher."""
+    def select(self, sample: VisualTokenSelectionSample) -> torch.Tensor:
+        """Return the visual tokens that remain visible to the Teacher."""
+
+    def selection_metrics(
+        self,
+        sample: VisualTokenSelectionSample,
+        keep_mask: torch.BoolTensor,
+    ) -> Mapping[str, float]:
+        return {}
+
+    @torch.no_grad()
+    def select_batch(self, batch: VisualTokenSelectionBatch) -> VisualTokenSelectionResult:
+        samples = _split_selection_batch(batch)
+        keep_masks: list[torch.BoolTensor] = []
+        target_keep_masks: list[torch.BoolTensor] = []
+        sample_ids: list[Any] = []
+        metrics: dict[str, float] = {}
+
+        for sample_idx, sample in enumerate(samples):
+            keep_mask = self.select(sample)
+            if not isinstance(keep_mask, torch.Tensor):
+                raise TypeError(
+                    f"Visual token selection strategy returned {type(keep_mask)}, expected torch.Tensor"
+                )
+            if keep_mask.ndim != 1 or keep_mask.dtype != torch.bool:
+                raise ValueError("strategy keep_mask must be a rank-1 bool tensor")
+            if keep_mask.shape != sample.target_keep_mask.shape:
+                raise ValueError(
+                    "strategy keep_mask must match target_keep_mask, "
+                    f"got {tuple(keep_mask.shape)} and {tuple(sample.target_keep_mask.shape)}"
+                )
+            target_on_keep_device = sample.target_keep_mask.to(device=keep_mask.device)
+            if torch.any(target_on_keep_device & ~keep_mask):
+                raise ValueError("visual token selection strategy must retain every target token")
+
+            compact_keep_mask = keep_mask.detach().to(dtype=torch.bool).clone()
+            compact_target_mask = sample.target_keep_mask.detach().to(device="cpu", dtype=torch.bool).clone()
+            keep_masks.append(compact_keep_mask)
+            target_keep_masks.append(compact_target_mask)
+            sample_ids.append(sample.sample_id)
+            for key, value in self.selection_metrics(sample, compact_keep_mask).items():
+                metrics[key] = metrics.get(key, 0.0) + float(value)
+
+        return VisualTokenSelectionResult(
+            keep_masks=tuple(keep_masks),
+            target_keep_masks=tuple(target_keep_masks),
+            sample_ids=tuple(sample_ids),
+            metrics=metrics,
+        )
 
 
-@dataclass(frozen=True)
-class VisualTokenSelectionRequest:
-    """Per-forward request consumed by Qwen3.5 ``_get_input_embeds``.
+class VisualTokenSelectionSession:
+    """Single-use bridge between one Student forward and its Teacher forward."""
 
-    This object is deliberately ephemeral.  It is passed as a dedicated model
-    kwarg for the student call and is never stored in a DataProto or in the
-    multimodal sample dictionaries.
-    """
+    def __init__(
+        self,
+        *,
+        strategy: VisualTokenSelectionStrategy,
+        metadata: Sequence[Mapping[str, Any]],
+        valid_sequence_lengths: Sequence[int],
+        spatial_merge_size: int,
+    ) -> None:
+        if not isinstance(strategy, VisualTokenSelectionStrategy):
+            raise TypeError(f"strategy must be a VisualTokenSelectionStrategy, got {type(strategy)}")
+        self._strategy = strategy
+        self._metadata = tuple(dict(item) for item in metadata)
+        self._valid_sequence_lengths = tuple(int(length) for length in valid_sequence_lengths)
+        self._spatial_merge_size = int(spatial_merge_size)
+        self._started = False
+        self._result: VisualTokenSelectionResult | None = None
 
-    strategy: VisualTokenSelectionStrategy
-    target_keep_mask: torch.BoolTensor
-    sample_ids: tuple[Any, ...]
-    spatial_merge_size: int
+        if not self._metadata:
+            raise ValueError("visual token selection requires at least one sample")
+        if len(self._metadata) != len(self._valid_sequence_lengths):
+            raise ValueError(
+                "selection metadata and valid sequence lengths must have the same size, "
+                f"got metadata={len(self._metadata)} and lengths={len(self._valid_sequence_lengths)}"
+            )
+        if any(length <= 0 for length in self._valid_sequence_lengths):
+            raise ValueError(f"valid sequence lengths must be positive, got {self._valid_sequence_lengths}")
+        if self._spatial_merge_size <= 0:
+            raise ValueError(f"spatial_merge_size must be positive, got {self._spatial_merge_size}")
+
+    @torch.no_grad()
+    def execute(
+        self,
+        *,
+        image_embeds: torch.Tensor,
+        inputs_embeds: torch.Tensor,
+        image_mask: torch.BoolTensor,
+        image_grid_thw: torch.Tensor,
+    ) -> None:
+        if self._started:
+            raise RuntimeError("Visual token selection session can only be executed once")
+        self._started = True
+        batch = VisualTokenSelectionBatch(
+            image_embeds=image_embeds,
+            inputs_embeds=inputs_embeds,
+            image_mask=image_mask,
+            image_grid_thw=image_grid_thw,
+            valid_sequence_lengths=self._valid_sequence_lengths,
+            metadata=self._metadata,
+            spatial_merge_size=self._spatial_merge_size,
+        )
+        self._result = self._strategy.select_batch(batch)
+
+    @property
+    def result(self) -> VisualTokenSelectionResult:
+        if self._result is None:
+            if self._started:
+                raise RuntimeError("Visual token selection session did not complete successfully")
+            raise RuntimeError("Visual token selection session has not been executed")
+        return self._result
 
 
 VISUAL_TOKEN_SELECTION_STRATEGY_REGISTRY: dict[str, type[VisualTokenSelectionStrategy]] = {}
@@ -85,9 +198,7 @@ def register_visual_token_selection_strategy(
     if not name:
         raise ValueError("Visual token selection strategy name must not be empty")
 
-    def decorator(
-        strategy_cls: type[VisualTokenSelectionStrategy],
-    ) -> type[VisualTokenSelectionStrategy]:
+    def decorator(strategy_cls: type[VisualTokenSelectionStrategy]) -> type[VisualTokenSelectionStrategy]:
         if not issubclass(strategy_cls, VisualTokenSelectionStrategy):
             raise TypeError(f"Visual token selection strategy {strategy_cls} must inherit VisualTokenSelectionStrategy")
         existing = VISUAL_TOKEN_SELECTION_STRATEGY_REGISTRY.get(name)
@@ -111,38 +222,6 @@ def create_visual_token_selection_strategy(
         return strategy_cls(**dict(kwargs or {}))
     except TypeError as exc:
         raise ValueError(f"Invalid parameters for visual token selection strategy {name!r}: {exc}") from exc
-
-
-_INT63_MASK = 0x7FFFFFFFFFFFFFFF
-
-
-def _stable_sample_seed(sample_id: Any, seed: int) -> int:
-    payload = f"{sample_id}|{seed}".encode()
-    digest = hashlib.blake2b(payload, digest_size=8).digest()
-    return int.from_bytes(digest, byteorder="little") & _INT63_MASK
-
-
-def _spread_morton_bits(values: torch.Tensor) -> torch.Tensor:
-    """Spread 16-bit coordinates into alternating bits using vectorized integer operations."""
-    values = values & 0xFFFF
-    values = (values | (values << 8)) & 0x00FF00FF
-    values = (values | (values << 4)) & 0x0F0F0F0F
-    values = (values | (values << 2)) & 0x33333333
-    return (values | (values << 1)) & 0x55555555
-
-
-def _morton_codes(rows: torch.Tensor, cols: torch.Tensor) -> torch.Tensor:
-    return _spread_morton_bits(cols) | (_spread_morton_bits(rows) << 1)
-
-
-def _stateless_stratum_hash(strata: torch.Tensor, sample_seed: int) -> torch.Tensor:
-    """Return deterministic non-negative int64 hashes on either CPU or GPU."""
-    values = (strata + sample_seed + 0x1E3779B97F4A7C15) & _INT63_MASK
-    values = values ^ (values >> 30)
-    values = (values * 0x3F58476D1CE4E5B9) & _INT63_MASK
-    values = values ^ (values >> 27)
-    values = (values * 0x14D049BB133111EB) & _INT63_MASK
-    return values ^ (values >> 31)
 
 
 def build_bbox_target_keep_mask(
@@ -181,414 +260,160 @@ def build_bbox_target_keep_mask(
     return target_keep_mask.flatten()
 
 
-_INTEGER_DTYPES = {
-    torch.uint8,
-    torch.int8,
-    torch.int16,
-    torch.int32,
-    torch.int64,
-}
+_INTEGER_DTYPES = {torch.uint8, torch.int8, torch.int16, torch.int32, torch.int64}
 
 
-def _validate_selection_input(
-    selection_input: VisualTokenSelectionInput,
-) -> tuple[list[tuple[int, int]], list[int], int]:
-    """Validate a one-image or whole-micro-batch selection request.
+def _split_selection_batch(batch: VisualTokenSelectionBatch) -> list[VisualTokenSelectionSample]:
+    image_embeds = batch.image_embeds
+    inputs_embeds = batch.inputs_embeds
+    image_mask = batch.image_mask
+    image_grid_thw = batch.image_grid_thw
+    sample_count = len(batch.metadata)
 
-    ``target_keep_mask`` and ``image_embeds`` are always flattened in image
-    order.  For the new batch interface the configured merge size determines
-    each image's token count from ``image_grid_thw``; the legacy one-image
-    helper infers it from the mask length.
-    """
+    if batch.spatial_merge_size <= 0:
+        raise ValueError(f"spatial_merge_size must be positive, got {batch.spatial_merge_size}")
 
-    image_embeds = selection_input.image_embeds
-    image_grid_thw = selection_input.image_grid_thw
-    target_keep_mask = selection_input.target_keep_mask
-
-    if image_embeds.ndim != 2:
-        raise ValueError(f"image_embeds must have shape [tokens, hidden], got {tuple(image_embeds.shape)}")
-    if image_embeds.shape[1] == 0 or not torch.is_floating_point(image_embeds):
-        raise ValueError("image_embeds must have a non-empty floating-point hidden dimension")
-    if image_grid_thw.ndim == 1:
-        if image_grid_thw.shape != (3,):
-            raise ValueError(
-                f"image_grid_thw must contain [t, h, w], got {tuple(image_grid_thw.shape)}"
-            )
-        image_grid_rows = image_grid_thw.unsqueeze(0)
-    elif image_grid_thw.ndim == 2 and image_grid_thw.shape[1] == 3:
-        image_grid_rows = image_grid_thw
-    else:
+    if image_embeds.ndim != 2 or not torch.is_floating_point(image_embeds) or image_embeds.shape[1] == 0:
         raise ValueError(
-            "image_grid_thw must have shape [3] or [images, 3], "
-            f"got {tuple(image_grid_thw.shape)}"
+            "image_embeds must have shape [tokens, hidden] with floating-point values, "
+            f"got {tuple(image_embeds.shape)} and {image_embeds.dtype}"
+        )
+    if inputs_embeds.ndim != 3 or inputs_embeds.shape[0] != 1:
+        raise ValueError(
+            "remove-padding visual selection requires inputs_embeds with shape [1, valid_tokens, hidden], "
+            f"got {tuple(inputs_embeds.shape)}"
+        )
+    if image_mask.ndim != 2 or image_mask.shape != inputs_embeds.shape[:2] or image_mask.dtype != torch.bool:
+        raise ValueError(
+            "image_mask must be a rank-2 bool tensor aligned with inputs_embeds, "
+            f"got {tuple(image_mask.shape)} and {image_mask.dtype}"
+        )
+    if inputs_embeds.shape[-1] != image_embeds.shape[-1]:
+        raise ValueError(
+            "image and multimodal embedding hidden dimensions must match, "
+            f"got {image_embeds.shape[-1]} and {inputs_embeds.shape[-1]}"
+        )
+    if image_grid_thw.ndim != 2 or image_grid_thw.shape != (sample_count, 3):
+        raise ValueError(
+            "visual token selection requires exactly one image per sample, "
+            f"got image_grid_thw={tuple(image_grid_thw.shape)} and samples={sample_count}"
         )
     if image_grid_thw.dtype not in _INTEGER_DTYPES:
         raise ValueError(f"image_grid_thw must use an integer dtype, got {image_grid_thw.dtype}")
-    if target_keep_mask.ndim != 1 or target_keep_mask.dtype != torch.bool:
-        raise ValueError("target_keep_mask must be a rank-1 bool tensor")
+    if len(batch.valid_sequence_lengths) != sample_count:
+        raise ValueError("valid sequence lengths must contain one value per sample")
+    if sum(batch.valid_sequence_lengths) != inputs_embeds.shape[1]:
+        raise ValueError(
+            "valid sequence lengths do not cover the remove-padding embedding, "
+            f"got lengths={sum(batch.valid_sequence_lengths)} and tokens={inputs_embeds.shape[1]}"
+        )
 
-    image_count = image_grid_rows.shape[0]
-    if selection_input.sample_ids is not None:
-        if len(selection_input.sample_ids) != image_count:
-            raise ValueError(
-                "sample_ids must contain one id per image, "
-                f"got images={image_count} and sample_ids={len(selection_input.sample_ids)}"
-            )
-        if any(sample_id is None for sample_id in selection_input.sample_ids):
-            raise ValueError("sample_ids must not contain None")
-    elif image_count == 1:
-        if selection_input.sample_id is None:
-            raise ValueError("sample_id must not be None")
-    else:
-        raise ValueError("batch visual token selection requires sample_ids")
-
-    configured_merge_size = selection_input.spatial_merge_size
-    if configured_merge_size is not None:
-        merge_size = int(configured_merge_size)
-        if merge_size <= 0:
-            raise ValueError(f"spatial_merge_size must be positive, got {configured_merge_size}")
-    else:
-        if image_count != 1:
-            raise ValueError("batch visual token selection requires spatial_merge_size")
-        grid_t, patch_grid_height, patch_grid_width = (int(value) for value in image_grid_rows[0].tolist())
-        if grid_t != 1 or patch_grid_height <= 0 or patch_grid_width <= 0:
-            raise ValueError(
-                "visual token selection supports one static image, "
-                f"got image_grid_thw={(grid_t, patch_grid_height, patch_grid_width)}"
-            )
-        merged_token_count = target_keep_mask.numel()
-        if merged_token_count == 0:
-            raise ValueError("target_keep_mask must not be empty")
-        patch_token_count = patch_grid_height * patch_grid_width
-        if patch_token_count % merged_token_count:
-            raise ValueError(
-                "image_grid_thw cannot be aligned with the merged-token mask, "
-                f"got patch tokens={patch_token_count} and merged tokens={merged_token_count}"
-            )
-        merge_area = patch_token_count // merged_token_count
-        merge_size = math.isqrt(merge_area)
-        if merge_size**2 != merge_area:
-            raise ValueError(
-                "image_grid_thw and target mask imply an invalid spatial merge, "
-                f"got grid={(grid_t, patch_grid_height, patch_grid_width)}, mask={merged_token_count}"
-            )
-
-    grid_shapes: list[tuple[int, int]] = []
     token_counts: list[int] = []
-    for row in image_grid_rows.tolist():
-        grid_t, patch_grid_height, patch_grid_width = (int(value) for value in row)
-        if grid_t != 1 or patch_grid_height <= 0 or patch_grid_width <= 0:
+    grid_shapes: list[tuple[int, int]] = []
+    for grid in image_grid_thw.tolist():
+        grid_t, patch_grid_height, patch_grid_width = (int(value) for value in grid)
+        if grid_t != 1:
+            raise ValueError(f"visual token selection supports still images only, got grid_t={grid_t}")
+        if patch_grid_height <= 0 or patch_grid_width <= 0:
+            raise ValueError(f"visual grid dimensions must be positive, got {grid}")
+        if patch_grid_height % batch.spatial_merge_size or patch_grid_width % batch.spatial_merge_size:
             raise ValueError(
-                "visual token selection supports one static image, "
-                f"got image_grid_thw={(grid_t, patch_grid_height, patch_grid_width)}"
+                f"image grid {(patch_grid_height, patch_grid_width)} is not divisible by "
+                f"merge size {batch.spatial_merge_size}"
             )
-        if patch_grid_height % merge_size or patch_grid_width % merge_size:
-            raise ValueError(
-                f"image grid {(patch_grid_height, patch_grid_width)} is not divisible by merge size {merge_size}"
-            )
-        grid_shapes.append((patch_grid_height // merge_size, patch_grid_width // merge_size))
-        token_counts.append((patch_grid_height // merge_size) * (patch_grid_width // merge_size))
+        grid_height = patch_grid_height // batch.spatial_merge_size
+        grid_width = patch_grid_width // batch.spatial_merge_size
+        grid_shapes.append((grid_height, grid_width))
+        token_counts.append(grid_height * grid_width)
 
-    expected_token_count = sum(token_counts)
-    if target_keep_mask.numel() != expected_token_count:
-        raise ValueError(
-            "image_grid_thw and target_keep_mask do not match, "
-            f"got mask={target_keep_mask.numel()} and expected tokens={expected_token_count}"
-        )
-    if image_embeds.shape[0] != expected_token_count:
-        raise ValueError(
-            "dense image embeddings and image_grid_thw do not match, "
-            f"got embeddings={image_embeds.shape[0]} and expected tokens={expected_token_count}"
-        )
-
-    if selection_input.inputs_embeds is not None or selection_input.image_mask is not None:
-        if selection_input.inputs_embeds is None or selection_input.image_mask is None:
-            raise ValueError("inputs_embeds and image_mask must be supplied together")
-        if selection_input.inputs_embeds.ndim != 3:
-            raise ValueError(
-                "inputs_embeds must have shape [batch, sequence, hidden], "
-                f"got {tuple(selection_input.inputs_embeds.shape)}"
-            )
-        if selection_input.image_mask.ndim != 2 or selection_input.image_mask.dtype != torch.bool:
-            raise ValueError("image_mask must be a rank-2 bool tensor")
-        if selection_input.inputs_embeds.shape[:2] != selection_input.image_mask.shape:
-            raise ValueError(
-                "inputs_embeds and image_mask sequence dimensions do not match, "
-                f"got embeds={tuple(selection_input.inputs_embeds.shape[:2])} "
-                f"and mask={tuple(selection_input.image_mask.shape)}"
-            )
-        if int(selection_input.image_mask.sum().item()) != expected_token_count:
-            raise ValueError(
-                "image_mask image-token count does not match image_grid_thw, "
-                f"got mask={int(selection_input.image_mask.sum().item())} and expected={expected_token_count}"
-            )
-
-    return grid_shapes, token_counts, merge_size
-
-
-def select_visual_tokens(
-    strategy: VisualTokenSelectionStrategy,
-    selection_input: VisualTokenSelectionInput,
-) -> VisualTokenSelectionOutput:
-    _validate_selection_input(selection_input)
-    normalized_input = VisualTokenSelectionInput(
-        image_embeds=selection_input.image_embeds,
-        image_grid_thw=selection_input.image_grid_thw,
-        target_keep_mask=selection_input.target_keep_mask.to(device=selection_input.image_embeds.device),
-        sample_id=selection_input.sample_id,
-        inputs_embeds=selection_input.inputs_embeds,
-        image_mask=selection_input.image_mask,
-        sample_ids=selection_input.sample_ids,
-        spatial_merge_size=selection_input.spatial_merge_size,
-    )
-    output = strategy.select(normalized_input)
-    if not isinstance(output, VisualTokenSelectionOutput):
-        raise TypeError(f"Visual token selection strategy returned {type(output)}, expected VisualTokenSelectionOutput")
-    keep_mask = output.keep_mask
-    if keep_mask.ndim != 1 or keep_mask.dtype != torch.bool:
-        raise ValueError("strategy keep_mask must be a rank-1 bool tensor")
-    if keep_mask.shape != normalized_input.target_keep_mask.shape:
-        raise ValueError(
-            "strategy keep_mask must match target_keep_mask, "
-            f"got {tuple(keep_mask.shape)} and {tuple(normalized_input.target_keep_mask.shape)}"
-        )
-    target_keep_mask = normalized_input.target_keep_mask.to(device=keep_mask.device)
-    if torch.any(target_keep_mask & ~keep_mask):
-        raise ValueError("visual token selection strategy must retain every target token")
-    return VisualTokenSelectionOutput(keep_mask=keep_mask.detach().clone(), metrics=dict(output.metrics))
-
-
-def select_visual_tokens_from_request(
-    *,
-    request: VisualTokenSelectionRequest,
-    image_embeds: torch.Tensor,
-    inputs_embeds: torch.Tensor,
-    image_mask: torch.BoolTensor,
-    image_grid_thw: torch.Tensor,
-) -> VisualTokenSelectionOutput:
-    """Run a registered strategy on the complete model-call context."""
-
-    selection_input = VisualTokenSelectionInput(
-        image_embeds=image_embeds,
-        inputs_embeds=inputs_embeds,
-        image_mask=image_mask,
-        image_grid_thw=image_grid_thw,
-        target_keep_mask=request.target_keep_mask,
-        sample_ids=tuple(request.sample_ids),
-        spatial_merge_size=request.spatial_merge_size,
-    )
-    # The strategy is discrete by contract.  Detached views ensure it cannot
-    # retain the Student's autograd graph or create a second embedding copy.
-    with torch.no_grad():
-        return select_visual_tokens(request.strategy, selection_input)
-
-
-def select_batched_visual_tokens(
-    *,
-    strategy: VisualTokenSelectionStrategy,
-    image_embeds: torch.Tensor,
-    image_grid_thw: torch.Tensor,
-    target_keep_masks: list[torch.Tensor],
-    sample_ids: list[Any],
-) -> list[VisualTokenSelectionOutput]:
-    if image_embeds.ndim != 2:
-        raise ValueError(f"image_embeds must have shape [tokens, hidden], got {tuple(image_embeds.shape)}")
-    if image_grid_thw.ndim != 2 or image_grid_thw.shape[1] != 3:
-        raise ValueError(f"image_grid_thw must have shape [images, 3], got {tuple(image_grid_thw.shape)}")
-    image_count = image_grid_thw.shape[0]
-    if len(target_keep_masks) != image_count or len(sample_ids) != image_count:
-        raise ValueError(
-            "selection metadata must contain one target mask and sample id per image, "
-            f"got grids={image_count}, targets={len(target_keep_masks)}, sample_ids={len(sample_ids)}"
-        )
-
-    token_counts = [int(mask.numel()) for mask in target_keep_masks]
     if sum(token_counts) != image_embeds.shape[0]:
         raise ValueError(
-            "flattened image embeddings do not match per-image target masks, "
-            f"got embeddings={image_embeds.shape[0]} and masks={sum(token_counts)}"
+            "dense image embeddings and image_grid_thw do not match, "
+            f"got embeddings={image_embeds.shape[0]} and expected tokens={sum(token_counts)}"
+        )
+    if int(image_mask.sum().item()) != image_embeds.shape[0]:
+        raise ValueError(
+            "image_mask and dense image embeddings do not match, "
+            f"got placeholders={int(image_mask.sum().item())} and embeddings={image_embeds.shape[0]}"
         )
 
-    outputs = []
-    offset = 0
-    for image_idx, token_count in enumerate(token_counts):
-        selection_input = VisualTokenSelectionInput(
-            image_embeds=image_embeds[offset : offset + token_count],
-            image_grid_thw=image_grid_thw[image_idx],
-            target_keep_mask=target_keep_masks[image_idx],
-            sample_id=sample_ids[image_idx],
-        )
-        outputs.append(select_visual_tokens(strategy, selection_input))
-        offset += token_count
-    return outputs
-
-
-def build_visual_token_selection_state(
-    *,
-    strategy: VisualTokenSelectionStrategy,
-    image_embeds: torch.Tensor,
-    image_grid_thw: torch.Tensor,
-    target_keep_masks: list[torch.Tensor],
-    sample_ids: list[Any],
-) -> VisualTokenSelectionState:
-    """Select tokens once and materialize the compact state consumed by teacher.
-
-    ``image_embeds`` is intentionally not present in the returned object.  The
-    caller can therefore delete the dense embedding immediately after this
-    function returns without leaving a hidden reference in the teacher path.
-    """
-
-    selection_outputs = select_batched_visual_tokens(
-        strategy=strategy,
-        image_embeds=image_embeds,
-        image_grid_thw=image_grid_thw,
-        target_keep_masks=target_keep_masks,
-        sample_ids=sample_ids,
-    )
-    if len(selection_outputs) != len(target_keep_masks):
-        raise RuntimeError(
-            "visual token selection returned an unexpected number of samples, "
-            f"got outputs={len(selection_outputs)} and targets={len(target_keep_masks)}"
-        )
-
-    keep_masks: list[torch.Tensor] = []
-    normalized_target_masks: list[torch.Tensor] = []
-    token_counts: list[int] = []
-    metrics: dict[str, float] = {}
-    total_token_count = 0
-    for sample_idx, (target_keep_mask, selection_output) in enumerate(
-        zip(target_keep_masks, selection_outputs, strict=True)
+    samples: list[VisualTokenSelectionSample] = []
+    sequence_offset = 0
+    image_offset = 0
+    for sample_idx, (metadata, sequence_length, token_count, grid_shape) in enumerate(
+        zip(batch.metadata, batch.valid_sequence_lengths, token_counts, grid_shapes, strict=True)
     ):
-        raw_target_keep_mask = target_keep_mask
-        raw_keep_mask = selection_output.keep_mask
-        if raw_target_keep_mask.dtype != torch.bool:
-            raise ValueError(f"target_keep_masks[{sample_idx}] must be a bool tensor")
-        if raw_keep_mask.dtype != torch.bool:
-            raise ValueError(f"selection keep_masks[{sample_idx}] must be a bool tensor")
-        if raw_target_keep_mask.ndim != 1 or raw_keep_mask.ndim != 1:
-            raise ValueError(f"selection masks[{sample_idx}] must be rank-1 tensors")
-        if raw_keep_mask.requires_grad or raw_target_keep_mask.requires_grad:
-            raise ValueError("visual token selection masks must not require gradients")
-        target_keep_mask = raw_target_keep_mask.detach()
-        keep_mask = raw_keep_mask.detach()
-        if keep_mask.numel() != target_keep_mask.numel():
+        required_metadata = {"bbox", "image_width", "image_height", "sample_id"}
+        missing_metadata = required_metadata - set(metadata)
+        if missing_metadata:
+            raise KeyError(f"selection metadata[{sample_idx}] is missing {sorted(missing_metadata)}")
+        if metadata["sample_id"] is None:
+            raise ValueError(f"selection metadata[{sample_idx}] sample_id must not be None")
+
+        sample_inputs_embeds = inputs_embeds[0, sequence_offset : sequence_offset + sequence_length]
+        sample_image_mask = image_mask[0, sequence_offset : sequence_offset + sequence_length]
+        sample_image_embeds = image_embeds[image_offset : image_offset + token_count]
+        if int(sample_image_mask.sum().item()) != token_count:
             raise ValueError(
-                f"selection masks[{sample_idx}] have mismatched lengths: "
-                f"keep={keep_mask.numel()} and target={target_keep_mask.numel()}"
+                f"sample {sample_idx} image placeholders do not match image_grid_thw, "
+                f"got placeholders={int(sample_image_mask.sum().item())} and expected={token_count}"
             )
-        target_on_keep_device = target_keep_mask.to(device=keep_mask.device)
-        if torch.any(target_on_keep_device & ~keep_mask):
-            raise ValueError(f"selection keep_masks[{sample_idx}] dropped a target token")
-        # Keep the masks detached and independent of strategy temporaries.  The
-        # target mask is small and kept on CPU to avoid retaining GPU storage.
-        keep_mask = keep_mask.to(dtype=torch.bool).clone()
-        target_keep_mask = target_keep_mask.to(device="cpu", dtype=torch.bool).clone()
-        keep_masks.append(keep_mask)
-        normalized_target_masks.append(target_keep_mask)
-        token_count = int(keep_mask.numel())
-        token_counts.append(token_count)
-        total_token_count += token_count
-        for key, value in selection_output.metrics.items():
-            metrics[key] = metrics.get(key, 0.0) + float(value)
 
-    if total_token_count != int(image_embeds.shape[0]):
-        raise RuntimeError(
-            "visual token selection state does not cover the dense embedding, "
-            f"got state tokens={total_token_count} and embeddings={image_embeds.shape[0]}"
+        grid_height, grid_width = grid_shape
+        target_keep_mask = build_bbox_target_keep_mask(
+            bbox=metadata["bbox"],
+            image_width=int(metadata["image_width"]),
+            image_height=int(metadata["image_height"]),
+            grid_height=grid_height,
+            grid_width=grid_width,
+            device=image_embeds.device,
         )
-    if len(sample_ids) != len(keep_masks):
-        raise RuntimeError(
-            "visual token selection state sample ids are misaligned, "
-            f"got sample_ids={len(sample_ids)} and masks={len(keep_masks)}"
-        )
-
-    return VisualTokenSelectionState(
-        keep_masks=keep_masks,
-        target_keep_masks=normalized_target_masks,
-        token_counts=token_counts,
-        sample_ids=list(sample_ids),
-        metrics=metrics,
-    )
-
-
-def build_visual_token_selection_state_from_keep_mask(
-    *,
-    keep_mask: torch.Tensor,
-    image_grid_thw: torch.Tensor,
-    target_keep_masks: list[torch.Tensor],
-    sample_ids: list[Any],
-    spatial_merge_size: int,
-) -> VisualTokenSelectionState:
-    """Materialize actor state from the mask returned by Qwen's Student call.
-
-    Strategy execution has already happened inside ``_get_input_embeds``.  This
-    helper only validates and splits the detached flat mask, so it never needs
-    the dense visual embedding.
-    """
-
-    if keep_mask.ndim != 1 or keep_mask.dtype != torch.bool:
-        raise ValueError("visual token keep_mask must be a rank-1 bool tensor")
-    if keep_mask.requires_grad:
-        raise ValueError("visual token keep_mask must not require gradients")
-    if image_grid_thw.ndim != 2 or image_grid_thw.shape[1] != 3:
-        raise ValueError(
-            "image_grid_thw must have shape [images, 3], "
-            f"got {tuple(image_grid_thw.shape)}"
-        )
-    if len(target_keep_masks) != image_grid_thw.shape[0] or len(sample_ids) != image_grid_thw.shape[0]:
-        raise ValueError(
-            "visual token selection metadata must contain one entry per image, "
-            f"got grids={image_grid_thw.shape[0]}, targets={len(target_keep_masks)}, sample_ids={len(sample_ids)}"
-        )
-    if spatial_merge_size <= 0:
-        raise ValueError(f"spatial_merge_size must be positive, got {spatial_merge_size}")
-
-    expected_counts: list[int] = []
-    for grid in image_grid_thw.tolist():
-        grid_t, grid_height, grid_width = (int(value) for value in grid)
-        if grid_t != 1 or grid_height % spatial_merge_size or grid_width % spatial_merge_size:
-            raise ValueError(
-                "visual token selection supports static grids divisible by spatial_merge_size, "
-                f"got grid={grid} and merge={spatial_merge_size}"
+        samples.append(
+            VisualTokenSelectionSample(
+                image_embeds=sample_image_embeds,
+                inputs_embeds=sample_inputs_embeds,
+                image_mask=sample_image_mask,
+                image_grid_thw=image_grid_thw[sample_idx],
+                target_keep_mask=target_keep_mask,
+                sample_id=metadata["sample_id"],
+                grid_height=grid_height,
+                grid_width=grid_width,
             )
-        expected_counts.append((grid_height // spatial_merge_size) * (grid_width // spatial_merge_size))
-
-    if keep_mask.numel() != sum(expected_counts):
-        raise ValueError(
-            "student keep_mask does not cover image_grid_thw, "
-            f"got mask={keep_mask.numel()} and expected={sum(expected_counts)}"
         )
+        sequence_offset += sequence_length
+        image_offset += token_count
 
-    keep_masks: list[torch.Tensor] = []
-    normalized_targets: list[torch.Tensor] = []
-    token_counts: list[int] = []
-    offset = 0
-    for sample_idx, (expected_count, target_keep_mask) in enumerate(
-        zip(expected_counts, target_keep_masks, strict=True)
-    ):
-        if target_keep_mask.ndim != 1 or target_keep_mask.dtype != torch.bool:
-            raise ValueError(f"target_keep_masks[{sample_idx}] must be a rank-1 bool tensor")
-        if target_keep_mask.numel() != expected_count:
-            raise ValueError(
-                f"target_keep_masks[{sample_idx}] has {target_keep_mask.numel()} tokens, "
-                f"expected {expected_count}"
-            )
-        sample_keep_mask = keep_mask[offset : offset + expected_count].detach().clone()
-        target_on_keep_device = target_keep_mask.to(device=sample_keep_mask.device)
-        if torch.any(target_on_keep_device & ~sample_keep_mask):
-            raise ValueError(f"student keep_mask dropped a target token for sample {sample_idx}")
-        keep_masks.append(sample_keep_mask)
-        normalized_targets.append(target_keep_mask.detach().to(device="cpu", dtype=torch.bool).clone())
-        token_counts.append(expected_count)
-        offset += expected_count
+    return samples
 
-    return VisualTokenSelectionState(
-        keep_masks=keep_masks,
-        target_keep_masks=normalized_targets,
-        token_counts=token_counts,
-        sample_ids=list(sample_ids),
-        metrics={},
-    )
+
+_INT63_MASK = 0x7FFFFFFFFFFFFFFF
+
+
+def _stable_sample_seed(sample_id: Any, seed: int) -> int:
+    payload = f"{sample_id}|{seed}".encode()
+    digest = hashlib.blake2b(payload, digest_size=8).digest()
+    return int.from_bytes(digest, byteorder="little") & _INT63_MASK
+
+
+def _spread_morton_bits(values: torch.Tensor) -> torch.Tensor:
+    values = values & 0xFFFF
+    values = (values | (values << 8)) & 0x00FF00FF
+    values = (values | (values << 4)) & 0x0F0F0F0F
+    values = (values | (values << 2)) & 0x33333333
+    return (values | (values << 1)) & 0x55555555
+
+
+def _morton_codes(rows: torch.Tensor, cols: torch.Tensor) -> torch.Tensor:
+    return _spread_morton_bits(cols) | (_spread_morton_bits(rows) << 1)
+
+
+def _stateless_stratum_hash(strata: torch.Tensor, sample_seed: int) -> torch.Tensor:
+    values = (strata + sample_seed + 0x1E3779B97F4A7C15) & _INT63_MASK
+    values = values ^ (values >> 30)
+    values = (values * 0x3F58476D1CE4E5B9) & _INT63_MASK
+    values = values ^ (values >> 27)
+    values = (values * 0x14D049BB133111EB) & _INT63_MASK
+    return values ^ (values >> 31)
 
 
 @register_visual_token_selection_strategy("fixed_stratified")
@@ -599,19 +424,13 @@ class FixedStratifiedVisualTokenSelectionStrategy(VisualTokenSelectionStrategy):
         self.background_keep_ratio = float(background_keep_ratio)
         self.seed = int(seed)
 
-    def _select_single(
-        self,
-        *,
-        target_keep_mask: torch.Tensor,
-        grid_height: int,
-        grid_width: int,
-        sample_id: Any,
-    ) -> torch.Tensor:
-        if grid_height > 0xFFFF or grid_width > 0xFFFF:
+    def select(self, sample: VisualTokenSelectionSample) -> torch.Tensor:
+        if sample.grid_height > 0xFFFF or sample.grid_width > 0xFFFF:
             raise ValueError(
                 "fixed_stratified supports merged visual grids up to 65535x65535, "
-                f"got {(grid_height, grid_width)}"
+                f"got {(sample.grid_height, sample.grid_width)}"
             )
+        target_keep_mask = sample.target_keep_mask
         if self.background_keep_ratio == 0.0:
             return target_keep_mask.clone()
         if self.background_keep_ratio == 1.0:
@@ -619,82 +438,28 @@ class FixedStratifiedVisualTokenSelectionStrategy(VisualTokenSelectionStrategy):
 
         background_indices = torch.nonzero(~target_keep_mask, as_tuple=True)[0]
         background_token_count = background_indices.numel()
-        kept_background_token_count = (
-            math.ceil(background_token_count * self.background_keep_ratio)
-            if self.background_keep_ratio > 0.0
-            else 0
+        kept_background_token_count = math.ceil(background_token_count * self.background_keep_ratio)
+        keep_mask = target_keep_mask.clone()
+        if kept_background_token_count == 0:
+            return keep_mask
+
+        rows = torch.div(background_indices, sample.grid_width, rounding_mode="floor")
+        cols = torch.remainder(background_indices, sample.grid_width)
+        morton_codes = _morton_codes(rows, cols)
+        ordered_background = background_indices[torch.argsort(morton_codes)]
+        strata = torch.arange(kept_background_token_count, device=target_keep_mask.device, dtype=torch.int64)
+        starts = torch.div(strata * background_token_count, kept_background_token_count, rounding_mode="floor")
+        ends = torch.div(
+            (strata + 1) * background_token_count,
+            kept_background_token_count,
+            rounding_mode="floor",
         )
-
-        keep_mask = target_keep_mask.clone()
-        if kept_background_token_count:
-            rows = torch.div(background_indices, grid_width, rounding_mode="floor")
-            cols = torch.remainder(background_indices, grid_width)
-            morton_codes = _morton_codes(rows, cols)
-            background_order = torch.argsort(morton_codes)
-            ordered_background = background_indices[background_order]
-            del rows, cols, morton_codes, background_order, background_indices
-
-            strata = torch.arange(
-                kept_background_token_count,
-                device=target_keep_mask.device,
-                dtype=torch.int64,
-            )
-            starts = torch.div(
-                strata * background_token_count,
-                kept_background_token_count,
-                rounding_mode="floor",
-            )
-            ends = torch.div(
-                (strata + 1) * background_token_count,
-                kept_background_token_count,
-                rounding_mode="floor",
-            )
-            offsets = torch.remainder(
-                _stateless_stratum_hash(
-                    strata,
-                    _stable_sample_seed(sample_id, self.seed),
-                ),
-                ends - starts,
-            )
-            keep_mask.scatter_(0, ordered_background[starts + offsets], True)
-            del ordered_background, strata, starts, ends, offsets
-
+        offsets = torch.remainder(
+            _stateless_stratum_hash(strata, _stable_sample_seed(sample.sample_id, self.seed)),
+            ends - starts,
+        )
+        keep_mask.scatter_(0, ordered_background[starts + offsets], True)
         return keep_mask
-
-    def select(self, selection_input: VisualTokenSelectionInput) -> VisualTokenSelectionOutput:
-        grid_shapes, token_counts, _ = _validate_selection_input(selection_input)
-        target_keep_mask = selection_input.target_keep_mask
-        image_count = len(token_counts)
-        if image_count == 1:
-            sample_id = (
-                selection_input.sample_ids[0]
-                if selection_input.sample_ids is not None
-                else selection_input.sample_id
-            )
-            keep_mask = self._select_single(
-                target_keep_mask=target_keep_mask,
-                grid_height=grid_shapes[0][0],
-                grid_width=grid_shapes[0][1],
-                sample_id=sample_id,
-            )
-            return VisualTokenSelectionOutput(keep_mask=keep_mask)
-
-        if selection_input.sample_ids is None:
-            raise ValueError("batch fixed_stratified selection requires sample_ids")
-        keep_mask = target_keep_mask.clone()
-        offset = 0
-        for token_count, (grid_height, grid_width), sample_id in zip(
-            token_counts, grid_shapes, selection_input.sample_ids, strict=True
-        ):
-            selected = self._select_single(
-                target_keep_mask=target_keep_mask[offset : offset + token_count],
-                grid_height=grid_height,
-                grid_width=grid_width,
-                sample_id=sample_id,
-            )
-            keep_mask[offset : offset + token_count] = selected
-            offset += token_count
-        return VisualTokenSelectionOutput(keep_mask=keep_mask)
 
 
 def apply_image_token_keep_mask(
