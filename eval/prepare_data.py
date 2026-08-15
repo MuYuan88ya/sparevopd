@@ -4,27 +4,9 @@ import json
 import sys
 from pathlib import Path
 
-from tqdm import tqdm
-
+from eval_utils import BENCHMARK_JSON_MAP
 from huggingface_hub import snapshot_download
-
-BENCHMARK_JSON_MAP = {
-    "zoombench": "zoombench.json",
-    "vstar": "vstar.json",
-    "hrbench-4k": "hr_bench_4k.json",
-    "hrbench-8k": "hr_bench_8k.json",
-    "mme-realworld": "MME_RealWorld.json",
-    "mme-realworld-cn": "MME_RealWorld_CN.json",
-    "mme-realworld-lite": "MME_RealWorld_Lite.json",
-    "mmstar": "mmstar.json",
-    "pope": "POPE.json",
-    "pope_adv": "POPE_adv.json",
-    "pope_pop": "POPE_pop.json",
-    "pope_random": "POPE_random.json",
-    "cv-bench": "cv_bench.json",
-    "mmvp": "mmvp.json",
-    "visualprobe": "visualprobe.json",
-}
+from tqdm import tqdm
 
 
 def resolve_benchmark_json(benchmark):
@@ -365,7 +347,7 @@ def prepare_mmvp(out_dir):
     img_src_dir = local_dir / "MMVP Images"
 
     data = []
-    with open(csv_path, "r", encoding="utf-8") as f:
+    with open(csv_path, encoding="utf-8") as f:
         reader = csv.DictReader(f)
         for row in reader:
             qid = int(row["Index"])
@@ -400,7 +382,7 @@ def prepare_visualprobe(out_dir):
         snapshot_download(repo_id, repo_type="dataset", local_dir=str(local_dir))
 
         val_path = local_dir / "val.json"
-        with open(val_path, "r", encoding="utf-8") as f:
+        with open(val_path, encoding="utf-8") as f:
             records = json.load(f)
 
         for record in tqdm(records, desc=f"Processing VisualProbe {category}", unit="img"):

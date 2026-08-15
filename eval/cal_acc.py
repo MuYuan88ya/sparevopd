@@ -3,6 +3,8 @@ import json
 import sys
 from collections import defaultdict
 
+from eval_utils import atomic_write_json
+
 
 def is_correct(item):
     return str(item.get("judge", "")).strip().lower() == "yes"
@@ -14,7 +16,7 @@ def acc_text(correct, total):
 
 
 def calc_vstar(judge_json, benchmark):
-    with open(judge_json, "r", encoding="utf-8") as f:
+    with open(judge_json, encoding="utf-8") as f:
         data = json.load(f)
 
     category_stats = defaultdict(lambda: {"correct": 0, "total": 0})
@@ -34,12 +36,25 @@ def calc_vstar(judge_json, benchmark):
 
     overall_acc = (100.0 * overall_correct / len(data)) if data else 0.0
     print(f"{benchmark} Acc: {overall_acc:.2f}% (n={len(data)})")
+    return {
+        "benchmark": benchmark,
+        "accuracy": overall_acc,
+        "correct": overall_correct,
+        "total": len(data),
+        "categories": {
+            category: {
+                **stats,
+                "accuracy": (100.0 * stats["correct"] / stats["total"]) if stats["total"] else 0.0,
+            }
+            for category, stats in category_stats.items()
+        },
+    }
 
 
 def calc_hrbench(judge_json, benchmark, benchmark_json):
-    with open(judge_json, "r", encoding="utf-8") as f:
+    with open(judge_json, encoding="utf-8") as f:
         records = json.load(f)
-    with open(benchmark_json, "r", encoding="utf-8") as f:
+    with open(benchmark_json, encoding="utf-8") as f:
         benchmark_records = json.load(f)
 
     def image_key(item):
@@ -73,12 +88,25 @@ def calc_hrbench(judge_json, benchmark, benchmark_json):
             category_stats[category]["correct"] += 1
 
     print(f"{benchmark} Acc: {acc_text(overall_correct, len(records))}")
+    return {
+        "benchmark": benchmark,
+        "accuracy": (100.0 * overall_correct / len(records)) if records else 0.0,
+        "correct": overall_correct,
+        "total": len(records),
+        "categories": {
+            category: {
+                **stats,
+                "accuracy": (100.0 * stats["correct"] / stats["total"]) if stats["total"] else 0.0,
+            }
+            for category, stats in category_stats.items()
+        },
+    }
 
 
 def calc_mme_realworld(judge_json, benchmark, benchmark_json):
-    with open(judge_json, "r", encoding="utf-8") as f:
+    with open(judge_json, encoding="utf-8") as f:
         records = json.load(f)
-    with open(benchmark_json, "r", encoding="utf-8") as f:
+    with open(benchmark_json, encoding="utf-8") as f:
         benchmark_records = json.load(f)
 
     def image_key(item):
@@ -118,6 +146,23 @@ def calc_mme_realworld(judge_json, benchmark, benchmark_json):
             supercategory_stats[supercategory]["correct"] += 1
 
     print(f"{benchmark} Acc: {acc_text(overall_correct, len(records))}")
+    def serialize_stats(stats_by_name):
+        return {
+            name: {
+                **stats,
+                "accuracy": (100.0 * stats["correct"] / stats["total"]) if stats["total"] else 0.0,
+            }
+            for name, stats in stats_by_name.items()
+        }
+
+    return {
+        "benchmark": benchmark,
+        "accuracy": (100.0 * overall_correct / len(records)) if records else 0.0,
+        "correct": overall_correct,
+        "total": len(records),
+        "categories": serialize_stats(category_stats),
+        "supercategories": serialize_stats(supercategory_stats),
+    }
 
 
 def _pope_metrics(items):
@@ -151,15 +196,24 @@ def _pope_fmt(label, accuracy, precision, recall, f1, yes_ratio, total):
 
 
 def calc_pope(judge_json, benchmark):
-    with open(judge_json, "r", encoding="utf-8") as f:
+    with open(judge_json, encoding="utf-8") as f:
         data = json.load(f)
 
     a, p, r, f1, yr, n = _pope_metrics(data)
     print(_pope_fmt(benchmark, a, p, r, f1, yr, n))
+    return {
+        "benchmark": benchmark,
+        "accuracy": 100.0 * a,
+        "precision": 100.0 * p,
+        "recall": 100.0 * r,
+        "f1": 100.0 * f1,
+        "yes_ratio": 100.0 * yr,
+        "total": n,
+    }
 
 
 def calc_cvbench(judge_json, benchmark):
-    with open(judge_json, "r", encoding="utf-8") as f:
+    with open(judge_json, encoding="utf-8") as f:
         data = json.load(f)
 
     type_stats = defaultdict(lambda: {"correct": 0, "total": 0})
@@ -174,10 +228,22 @@ def calc_cvbench(judge_json, benchmark):
     acc_avg = (acc_2d + acc_3d) / 2.0
 
     print(f"{benchmark}: {100*acc_avg:.2f}%")
+    return {
+        "benchmark": benchmark,
+        "accuracy": 100.0 * acc_avg,
+        "types": {
+            name: {
+                **stats,
+                "accuracy": (100.0 * stats["correct"] / stats["total"]) if stats["total"] else 0.0,
+            }
+            for name, stats in type_stats.items()
+        },
+        "total": len(data),
+    }
 
 
 def calc_visualprobe(judge_json, benchmark):
-    with open(judge_json, "r", encoding="utf-8") as f:
+    with open(judge_json, encoding="utf-8") as f:
         data = json.load(f)
 
     cat_stats = defaultdict(lambda: {"correct": 0, "total": 0})
@@ -196,45 +262,68 @@ def calc_visualprobe(judge_json, benchmark):
 
     avg_acc = sum(accs) / len(accs) if accs else 0.0
     print(f"{benchmark} average: {avg_acc:.2f}%")
+    return {
+        "benchmark": benchmark,
+        "accuracy": avg_acc,
+        "total": len(data),
+        "categories": {
+            category: {
+                **stats,
+                "accuracy": (100.0 * stats["correct"] / stats["total"]) if stats["total"] else 0.0,
+            }
+            for category, stats in cat_stats.items()
+        },
+    }
 
 
 def calc_generic(judge_json, benchmark):
-    with open(judge_json, "r", encoding="utf-8") as f:
+    with open(judge_json, encoding="utf-8") as f:
         data = json.load(f)
     n = len(data)
     c = sum(1 for x in data if is_correct(x))
-    print(f"{benchmark} Acc: {c}/{n} = {100 * c / n:.2f}%")
+    accuracy = (100.0 * c / n) if n else 0.0
+    print(f"{benchmark} Acc: {c}/{n} = {accuracy:.2f}%")
+    return {"benchmark": benchmark, "accuracy": accuracy, "correct": c, "total": n}
 
 
 def main():
     parser = argparse.ArgumentParser(description="Calculate accuracy from judge results")
     parser.add_argument("--benchmark", required=True, type=str)
     parser.add_argument("--judge_json", required=True, type=str, help="Path to judge output JSON")
-    parser.add_argument("--benchmark_json", default=None, type=str, help="Path to original benchmark JSON (for category breakdown)")
+    parser.add_argument(
+        "--benchmark_json",
+        default=None,
+        type=str,
+        help="Path to original benchmark JSON (for category breakdown)",
+    )
+    parser.add_argument("--output_json", default=None, type=str, help="Optional machine-readable metric output")
     args = parser.parse_args()
 
     if args.benchmark == "visualprobe":
-        calc_visualprobe(args.judge_json, args.benchmark)
+        result = calc_visualprobe(args.judge_json, args.benchmark)
     elif args.benchmark == "cv-bench":
-        calc_cvbench(args.judge_json, args.benchmark)
+        result = calc_cvbench(args.judge_json, args.benchmark)
     elif args.benchmark in ("pope", "pope_adv", "pope_pop", "pope_random"):
-        calc_pope(args.judge_json, args.benchmark)
+        result = calc_pope(args.judge_json, args.benchmark)
     elif args.benchmark == "vstar":
-        calc_vstar(args.judge_json, args.benchmark)
+        result = calc_vstar(args.judge_json, args.benchmark)
     elif args.benchmark in ("hrbench-4k", "hrbench-8k"):
         if not args.benchmark_json:
             print("WARNING: --benchmark_json not provided, falling back to generic accuracy.", file=sys.stderr)
-            calc_generic(args.judge_json, args.benchmark)
+            result = calc_generic(args.judge_json, args.benchmark)
         else:
-            calc_hrbench(args.judge_json, args.benchmark, args.benchmark_json)
+            result = calc_hrbench(args.judge_json, args.benchmark, args.benchmark_json)
     elif args.benchmark in ("mme-realworld", "mme-realworld-cn", "mme-realworld-lite"):
         if not args.benchmark_json:
             print("WARNING: --benchmark_json not provided, falling back to generic accuracy.", file=sys.stderr)
-            calc_generic(args.judge_json, args.benchmark)
+            result = calc_generic(args.judge_json, args.benchmark)
         else:
-            calc_mme_realworld(args.judge_json, args.benchmark, args.benchmark_json)
+            result = calc_mme_realworld(args.judge_json, args.benchmark, args.benchmark_json)
     else:
-        calc_generic(args.judge_json, args.benchmark)
+        result = calc_generic(args.judge_json, args.benchmark)
+
+    if args.output_json:
+        atomic_write_json(args.output_json, result)
 
 
 if __name__ == "__main__":

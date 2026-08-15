@@ -1,16 +1,15 @@
 import argparse
 import base64
-import hashlib
 import json
 import mimetypes
 import os
-import sys
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from io import BytesIO
 from pathlib import Path
 
+from eval_utils import make_sample_uid
 from openai import OpenAI
 from PIL import Image
 from tqdm import tqdm
@@ -21,20 +20,6 @@ VSTAR_MAX_IMAGE_SIZE = 20 * 1024 * 1024
 
 def pick_image_path(item):
     return (item.get("images") or [""])[0]
-
-
-def make_sample_uid(item, benchmark):
-    for key in ("sample_uid", "uid", "index", "question_id", "id"):
-        value = item.get(key)
-        if value is not None and str(value) != "":
-            return f"{benchmark}:{key}:{value}"
-    stable_obj = {
-        "benchmark": benchmark,
-        "images": item.get("images") or [],
-        "query": item.get("query", ""),
-    }
-    raw = json.dumps(stable_obj, ensure_ascii=False, sort_keys=True)
-    return "sha1:" + hashlib.sha1(raw.encode("utf-8")).hexdigest()
 
 
 def should_retry_existing_record(item):
@@ -53,7 +38,7 @@ def compact_existing_output(path, benchmark):
     ordered_uids = []
     best_records = {}
     changed = False
-    with open(path, "r", encoding="utf-8") as f:
+    with open(path, encoding="utf-8") as f:
         for line in f:
             line = line.strip()
             if not line:
@@ -133,6 +118,7 @@ def main():
     parser.add_argument("--benchmark", required=True, type=str)
     parser.add_argument("--benchmark_json", required=True, type=str, help="Path to benchmark JSON file")
     parser.add_argument("--out_dir", default="model_answer", type=str)
+    parser.add_argument("--output_path", default=None, type=str, help="Exact answer JSONL path")
     parser.add_argument("--model_name", required=True, type=str)
     parser.add_argument("--seed", default=42, type=int)
     parser.add_argument("--api_base", required=True, type=str)
@@ -147,12 +133,16 @@ def main():
 
     benchmark = args.benchmark
     data_path = Path(args.benchmark_json)
-    with open(data_path, "r", encoding="utf-8") as f:
+    with open(data_path, encoding="utf-8") as f:
         total_data = json.load(f)
 
-    out_dir = Path(args.out_dir) / benchmark
-    out_dir.mkdir(parents=True, exist_ok=True)
-    out_path = out_dir / f"{args.model_name}_answer.jsonl"
+    if args.output_path:
+        out_path = Path(args.output_path)
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+    else:
+        out_dir = Path(args.out_dir) / benchmark
+        out_dir.mkdir(parents=True, exist_ok=True)
+        out_path = out_dir / f"{args.model_name}_answer.jsonl"
 
     done_ids = set()
     retry_ids = set()
@@ -240,7 +230,10 @@ def main():
         return record
 
     start = time.time()
-    with ThreadPoolExecutor(max_workers=args.parallel_workers) as executor, open(out_path, "a", encoding="utf-8") as f_out:
+    with (
+        ThreadPoolExecutor(max_workers=args.parallel_workers) as executor,
+        open(out_path, "a", encoding="utf-8") as f_out,
+    ):
         future_to_item = {executor.submit(run_one, item): item for item in todo_data}
         with tqdm(total=len(todo_data), desc="Inference", unit="case", dynamic_ncols=True) as pbar:
             for future in as_completed(future_to_item):

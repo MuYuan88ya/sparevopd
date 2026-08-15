@@ -1,143 +1,131 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# =============================================================================
-# Vision-OPD Evaluation Script
+# Vision-OPD staged evaluation.
 #
-# Supported benchmarks:
-#   vstar, zoombench, hrbench-4k, hrbench-8k, mme-realworld, mme-realworld-cn, mme-realworld-lite,
-#   mmstar, pope, pope_adv, pope_pop, pope_random, cv-bench, mmvp, visualprobe
-#
-# Usage:
-#   API_BASE="http://localhost:8000/v1/" \
-#   OPENAI_MODEL_ID="Vision-OPD-4B" \
-#   BENCHMARK="vstar,zoombench,hrbench-4k,hrbench-8k,mme-realworld,mme-realworld-cn" \
-#   bash eval/run_eval.sh
-# =============================================================================
+# EVAL_PHASE=generate: prepare every dataset, then generate every answer.
+# EVAL_PHASE=evaluate: judge and score an existing experiment manifest.
+# EVAL_PHASE=all: run both phases without managing either external API server.
 
 export MKL_SERVICE_FORCE_INTEL=1
 
-# --- Required ---
-API_BASE="${API_BASE:?ERROR: API_BASE must be set (e.g. http://localhost:8000/v1/)}"
-OPENAI_MODEL_ID="${OPENAI_MODEL_ID:?ERROR: OPENAI_MODEL_ID must be set}"
-
-# --- Optional ---
-BENCHMARK="${BENCHMARK:-vstar}"
-API_KEY="${OPENAI_API_KEY:-EMPTY}"
-MODEL_NAME="${MODEL_NAME:-${OPENAI_MODEL_ID//\//_}}"
-SEED="${SEED:-42}"
-MAX_TOKENS="${MAX_TOKENS:-32768}"
-OUT_DIR="${OUT_DIR:-model_answer}"
-MAX_RETRIES="${MAX_RETRIES:-3}"
-PARALLEL_WORKERS="${PARALLEL_WORKERS:-256}"
-ENABLE_THINKING="${ENABLE_THINKING:-}"
-
-JUDGE_API_BASE="${JUDGE_API_BASE:-}"
-JUDGE_API_KEY="${JUDGE_API_KEY:-}"
-JUDGE_MODEL="${JUDGE_MODEL:-}"
-JUDGE_MODEL_PATH="${JUDGE_MODEL_PATH:-}"
-JUDGE_MAX_TOKENS="${JUDGE_MAX_TOKENS:-2048}"
-
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-cd "${SCRIPT_DIR}"
+EVAL_PHASE="${EVAL_PHASE:-all}"
 
-# Benchmark JSON mapping
-declare -A BENCHMARK_JSON_MAP=(
-  [zoombench]="zoombench.json"
-  [vstar]="vstar.json"
-  [hrbench-4k]="hr_bench_4k.json"
-  [hrbench-8k]="hr_bench_8k.json"
-  [mme-realworld]="MME_RealWorld.json"
-  [mme-realworld-cn]="MME_RealWorld_CN.json"
-  [mme-realworld-lite]="MME_RealWorld_Lite.json"
-  [mmstar]="mmstar.json"
-  [pope]="POPE.json"
-  [pope_adv]="POPE_adv.json"
-  [pope_pop]="POPE_pop.json"
-  [pope_random]="POPE_random.json"
-  [cv-bench]="cv_bench.json"
-  [mmvp]="mmvp.json"
-  [visualprobe]="visualprobe.json"
-)
-
-# Parse comma-separated benchmarks
-IFS=',' read -r -a BENCHMARKS_TO_RUN <<< "${BENCHMARK}"
-
-run_single_benchmark() {
-  local bench="$1"
-  local bench_json="${BENCHMARK_JSON_MAP[$bench]:-}"
-  if [[ -z "${bench_json}" ]]; then
-    echo "ERROR: Unsupported benchmark: ${bench}"
-    exit 1
-  fi
-
-  echo "=========================================="
-  echo "Benchmark: ${bench}"
-  echo "API base: ${API_BASE}"
-  echo "Model: ${OPENAI_MODEL_ID}"
-  echo "=========================================="
-
-  local model_tag="${MODEL_NAME}_seed${SEED}"
-
-  # [1/4] Prepare data
-  echo "[1/4] Preparing data..."
-  python3 prepare_data.py --benchmark "${bench}" --data_dir "${SCRIPT_DIR}"
-
-  # [2/4] Inference
-  echo "[2/4] Running inference..."
-  local -a INFER_ARGS=(
-    --benchmark "${bench}"
-    --benchmark_json "${SCRIPT_DIR}/${bench_json}"
-    --out_dir "${OUT_DIR}"
-    --model_name "${model_tag}"
-    --seed "${SEED}"
-    --api_base "${API_BASE}"
-    --api_key "${API_KEY}"
-    --model_id "${OPENAI_MODEL_ID}"
-    --max_tokens "${MAX_TOKENS}"
-    --max_retries "${MAX_RETRIES}"
-    --parallel_workers "${PARALLEL_WORKERS}"
-  )
-  [[ -n "${ENABLE_THINKING}" ]] && INFER_ARGS+=(--enable_thinking "${ENABLE_THINKING}")
-
-  python3 infer.py "${INFER_ARGS[@]}"
-
-  # [3/4] Judge
-  echo "[3/4] Running judge..."
-  local -a JUDGE_ARGS=()
-  [[ -n "${JUDGE_API_BASE}" ]] && JUDGE_ARGS+=(--api_base "${JUDGE_API_BASE}")
-  [[ -n "${JUDGE_API_KEY}" ]] && JUDGE_ARGS+=(--api_key "${JUDGE_API_KEY}")
-  [[ -n "${JUDGE_MODEL}" ]] && JUDGE_ARGS+=(--judge_model "${JUDGE_MODEL}")
-  [[ -n "${JUDGE_MODEL_PATH}" ]] && JUDGE_ARGS+=(--judge_model_path "${JUDGE_MODEL_PATH}")
-  [[ -n "${JUDGE_MAX_TOKENS}" ]] && JUDGE_ARGS+=(--judge_max_tokens "${JUDGE_MAX_TOKENS}")
-
-  local judge_benchmark="${bench}"
-  local judge_model_tag="${model_tag}"
-  local judge_json="judge/${bench}/${model_tag}_answer.jsonl"
-
-  python3 judge_qwenlm.py \
-    --benchmark "${judge_benchmark}" \
-    --model "${judge_model_tag}" \
-    "${JUDGE_ARGS[@]}"
-
-  # [4/4] Accuracy
-  echo "[4/4] Calculating accuracy..."
-  python3 cal_acc.py \
-    --benchmark "${bench}" \
-    --judge_json "${judge_json}" \
-    --benchmark_json "${SCRIPT_DIR}/${bench_json}"
-
-  echo "Done: ${bench}"
+warn_legacy() {
+  local old_name="$1"
+  local new_name="$2"
+  echo "WARNING: ${old_name} is deprecated; use ${new_name}." >&2
 }
 
-# Main loop
-echo "Benchmarks to run: ${BENCHMARKS_TO_RUN[*]}"
-total="${#BENCHMARKS_TO_RUN[@]}"
-for idx in "${!BENCHMARKS_TO_RUN[@]}"; do
-  bench="${BENCHMARKS_TO_RUN[$idx]}"
-  bench="$(echo "${bench}" | xargs)"  # trim spaces
-  [[ -z "${bench}" ]] && continue
-  echo
-  echo "########## [$((idx + 1))/${total}] ${bench} ##########"
-  run_single_benchmark "${bench}"
-done
+if [[ -z "${EXPERIMENT_NAME:-}" ]]; then
+  if [[ -n "${MODEL_NAME:-}" ]]; then
+    warn_legacy MODEL_NAME EXPERIMENT_NAME
+    EXPERIMENT_NAME="${MODEL_NAME}"
+  else
+    echo "ERROR: EXPERIMENT_NAME must be set." >&2
+    exit 1
+  fi
+fi
+
+if [[ -z "${BENCHMARKS:-}" && -n "${BENCHMARK:-}" ]]; then
+  warn_legacy BENCHMARK BENCHMARKS
+  BENCHMARKS="${BENCHMARK}"
+fi
+BENCHMARKS="${BENCHMARKS:-}"
+
+if [[ -z "${OUTPUT_ROOT:-}" && -n "${OUT_DIR:-}" ]]; then
+  warn_legacy OUT_DIR OUTPUT_ROOT
+  OUTPUT_ROOT="${OUT_DIR}"
+fi
+OUTPUT_ROOT="${OUTPUT_ROOT:-${SCRIPT_DIR}/results}"
+
+if [[ -z "${EVAL_DATA_ROOT:-}" && -n "${DATA_DIR:-}" ]]; then
+  warn_legacy DATA_DIR EVAL_DATA_ROOT
+  EVAL_DATA_ROOT="${DATA_DIR}"
+fi
+EVAL_DATA_ROOT="${EVAL_DATA_ROOT:-}"
+
+if [[ -z "${GEN_API_BASE:-}" && -n "${API_BASE:-}" ]]; then
+  warn_legacy API_BASE GEN_API_BASE
+  GEN_API_BASE="${API_BASE}"
+fi
+if [[ -z "${GEN_API_KEY:-}" && -n "${OPENAI_API_KEY:-}" ]]; then
+  warn_legacy OPENAI_API_KEY GEN_API_KEY
+  GEN_API_KEY="${OPENAI_API_KEY}"
+fi
+if [[ -z "${GEN_MODEL_ID:-}" && -n "${OPENAI_MODEL_ID:-}" ]]; then
+  warn_legacy OPENAI_MODEL_ID GEN_MODEL_ID
+  GEN_MODEL_ID="${OPENAI_MODEL_ID}"
+fi
+if [[ -z "${JUDGE_MODEL_ID:-}" && -n "${JUDGE_MODEL:-}" ]]; then
+  warn_legacy JUDGE_MODEL JUDGE_MODEL_ID
+  JUDGE_MODEL_ID="${JUDGE_MODEL}"
+fi
+
+if [[ -n "${JUDGE_MODEL_PATH:-}" ]]; then
+  echo "ERROR: JUDGE_MODEL_PATH is no longer supported; configure a Judge OpenAI-compatible API." >&2
+  exit 1
+fi
+
+GEN_API_BASE="${GEN_API_BASE:-}"
+GEN_API_KEY="${GEN_API_KEY:-EMPTY}"
+GEN_MODEL_ID="${GEN_MODEL_ID:-}"
+JUDGE_API_BASE="${JUDGE_API_BASE:-}"
+JUDGE_API_KEY="${JUDGE_API_KEY:-EMPTY}"
+JUDGE_MODEL_ID="${JUDGE_MODEL_ID:-}"
+
+if [[ -z "${GEN_API_BASE}" && -n "${GEN_PORT:-}" ]]; then
+  GEN_API_BASE="http://127.0.0.1:${GEN_PORT}/v1"
+fi
+if [[ -z "${JUDGE_API_BASE}" && -n "${JUDGE_PORT:-}" ]]; then
+  JUDGE_API_BASE="http://127.0.0.1:${JUDGE_PORT}/v1"
+fi
+
+case "${EVAL_PHASE}" in
+  generate|all)
+    [[ -n "${EVAL_DATA_ROOT}" ]] || { echo "ERROR: EVAL_DATA_ROOT is required for ${EVAL_PHASE}." >&2; exit 1; }
+    [[ -n "${BENCHMARKS}" ]] || { echo "ERROR: BENCHMARKS is required for ${EVAL_PHASE}." >&2; exit 1; }
+    [[ -n "${GEN_API_BASE}" ]] || { echo "ERROR: GEN_API_BASE or GEN_PORT is required for ${EVAL_PHASE}." >&2; exit 1; }
+    ;;
+  evaluate)
+    ;;
+  *)
+    echo "ERROR: EVAL_PHASE must be generate, evaluate, or all; got ${EVAL_PHASE}." >&2
+    exit 1
+    ;;
+esac
+
+if [[ "${EVAL_PHASE}" == "evaluate" || "${EVAL_PHASE}" == "all" ]]; then
+  [[ -n "${JUDGE_API_BASE}" ]] || { echo "ERROR: JUDGE_API_BASE or JUDGE_PORT is required for ${EVAL_PHASE}." >&2; exit 1; }
+fi
+
+ARGS=(
+  --phase "${EVAL_PHASE}"
+  --experiment-name "${EXPERIMENT_NAME}"
+  --output-root "${OUTPUT_ROOT}"
+  --seed "${SEED:-42}"
+  --max-tokens "${MAX_TOKENS:-32768}"
+  --max-retries "${MAX_RETRIES:-3}"
+  --parallel-workers "${PARALLEL_WORKERS:-256}"
+  --gen-api-key "${GEN_API_KEY}"
+  --judge-api-key "${JUDGE_API_KEY}"
+  --judge-max-tokens "${JUDGE_MAX_TOKENS:-2048}"
+  --judge-parallel-workers "${JUDGE_PARALLEL_WORKERS:-32}"
+  --judge-max-retries "${JUDGE_MAX_RETRIES:-3}"
+  --judge-timeout "${JUDGE_TIMEOUT:-600}"
+)
+
+[[ -n "${EVAL_DATA_ROOT}" ]] && ARGS+=(--data-root "${EVAL_DATA_ROOT}")
+[[ -n "${BENCHMARKS}" ]] && ARGS+=(--benchmarks "${BENCHMARKS}")
+[[ -n "${GEN_API_BASE}" ]] && ARGS+=(--gen-api-base "${GEN_API_BASE}")
+[[ -n "${GEN_MODEL_ID}" ]] && ARGS+=(--gen-model-id "${GEN_MODEL_ID}")
+[[ -n "${JUDGE_API_BASE}" ]] && ARGS+=(--judge-api-base "${JUDGE_API_BASE}")
+[[ -n "${JUDGE_MODEL_ID}" ]] && ARGS+=(--judge-model-id "${JUDGE_MODEL_ID}")
+[[ -n "${ENABLE_THINKING:-}" ]] && ARGS+=(--enable-thinking "${ENABLE_THINKING}")
+[[ "${ALLOW_PARTIAL_EVAL:-false}" == "true" ]] && ARGS+=(--allow-partial-eval)
+
+echo "Experiment: ${EXPERIMENT_NAME}"
+echo "Phase: ${EVAL_PHASE}"
+echo "Output root: ${OUTPUT_ROOT}"
+python3 "${SCRIPT_DIR}/eval_pipeline.py" "${ARGS[@]}" "$@"

@@ -49,30 +49,46 @@ Please check out our [Hugging Face Collection](https://huggingface.co/collection
 
 ### 2. Evaluation
 
-Evaluate the deployed model on fine-grained visual benchmarks:
+Evaluation is split into generation and judging so the two externally hosted vLLM services do not need to share GPUs.
+First generate every benchmark answer through the model API:
 
 ```bash
-API_BASE="http://localhost:8000/v1/" \
-OPENAI_MODEL_ID="Vision-OPD-9B" \
-JUDGE_API_BASE="YOUR_JUDGE_API_BASE" \
-JUDGE_MODEL="YOUR_JUDGE_MODEL_NAME" \
-BENCHMARK="vstar,zoombench,hrbench-4k,hrbench-8k,mme-realworld,mme-realworld-cn" \
+EVAL_PHASE=generate \
+EXPERIMENT_NAME="vision-opd-9b-step100" \
+EVAL_DATA_ROOT="/path/to/eval-data" \
+BENCHMARKS="vstar,zoombench,hrbench-4k,hrbench-8k,mme-realworld,mme-realworld-cn" \
+GEN_PORT=8000 \
 bash eval/run_eval.sh
 ```
 
-Supported benchmarks: `vstar`, `zoombench`, `hrbench-4k`, `hrbench-8k`, `mme-realworld`, `mme-realworld-cn`, `mme-realworld-lite`, `visualprobe`, `mmvp`, `cv-bench`, `mmstar`, `pope`.
+Stop the generation service, start the Judge service, and evaluate the saved experiment:
 
-The evaluation script runs inference via the OpenAI-compatible API. Judge configuration can be set via `JUDGE_API_BASE` / `JUDGE_MODEL_PATH` environment variables. We use `openai/gpt-oss-120b` as the judge model. Other powerful models like Qwen3.5 or closed-source models are also recommended.
+```bash
+EVAL_PHASE=evaluate \
+EXPERIMENT_NAME="vision-opd-9b-step100" \
+JUDGE_PORT=8000 \
+bash eval/run_eval.sh
+```
+
+Both services use the OpenAI-compatible `/v1/models` and `/v1/chat/completions` APIs. The model ID is discovered
+automatically when the endpoint exposes exactly one model; use `GEN_MODEL_ID` or `JUDGE_MODEL_ID` to disambiguate a
+multi-model endpoint. Full remote endpoints can be supplied with `GEN_API_BASE` and `JUDGE_API_BASE` instead of ports.
+Missing datasets are downloaded under `EVAL_DATA_ROOT`. Answers, Judge results, metrics, and the resumable manifest are
+stored under `eval/results/EXPERIMENT_NAME` by default. Set `OUTPUT_ROOT` only when a different output location is needed.
+Local vLLM services do not require an API-key setting; `GEN_API_KEY` and `JUDGE_API_KEY` are optional overrides.
+See [`eval/README.md`](eval/README.md) for the complete evaluation guide.
+
+Supported benchmarks: `vstar`, `zoombench`, `hrbench-4k`, `hrbench-8k`, `mme-realworld`, `mme-realworld-cn`, `mme-realworld-lite`, `visualprobe`, `mmvp`, `cv-bench`, `mmstar`, `pope`.
 
 To evaluate Qwen3.5 models as baselines, set `ENABLE_THINKING=False` to run in non-thinking mode, for example:
 
 ```bash
-API_BASE="http://localhost:8000/v1/" \
-OPENAI_MODEL_ID="Qwen3.5-9B" \
+EVAL_PHASE=generate \
+EXPERIMENT_NAME="qwen35-9b" \
+EVAL_DATA_ROOT="/path/to/eval-data" \
+BENCHMARKS="vstar,zoombench" \
+GEN_PORT=8000 \
 ENABLE_THINKING=False \
-JUDGE_API_BASE="YOUR_JUDGE_API_BASE" \
-JUDGE_MODEL="YOUR_JUDGE_MODEL_NAME" \
-BENCHMARK="vstar,zoombench,hrbench-4k,hrbench-8k,mme-realworld,mme-realworld-cn" \
 bash eval/run_eval.sh
 ```
 
