@@ -18,6 +18,7 @@ Single Process Actor
 """
 
 import logging
+import math
 import os
 import time
 from types import SimpleNamespace
@@ -33,11 +34,17 @@ from verl import DataProto
 from verl.trainer.ppo.core_algos import agg_loss, compute_self_distillation_loss, get_policy_loss_fn, kl_penalty
 from verl.utils.attention_utils import index_first_axis, pad_input, rearrange, unpad_input
 from verl.utils.device import get_device_id, get_device_name
+from verl.utils.distillation_token_weight_metrics import DistillationTokenWeightMetricsAccumulator
 from verl.utils.fsdp_utils import FSDPModule, fsdp2_clip_grad_norm_
 from verl.utils.metric import AggregationType, Metric, reduce_metrics
 from verl.utils.profiler import GPUMemoryLogger
 from verl.utils.py_functional import append_to_dict
 from verl.utils.seqlen_balancing import prepare_dynamic_batch, restore_dynamic_batch
+from verl.utils.teacher_entropy_reweighting import (
+    TeacherEntropyWeightAccumulator,
+    global_valid_token_count,
+    scale_gradients_,
+)
 from verl.utils.teacher_visual_token_mask import (
     VisualTokenSelectionResult,
     VisualTokenSelectionSession,
@@ -127,7 +134,58 @@ class DataParallelPPOActor(BasePPOActor):
         self.teacher_visual_token_selection_strategy = None
         self.teacher_visual_image_token_id = None
         self.teacher_visual_spatial_merge_size = None
+        self.contrastive_visual_advantage_enabled = False
+        self.contrastive_negative_mode = "complement-random-equal"
+        self.contrastive_negative_seed = 0
+        self.teacher_entropy_reweighting_enabled = False
+        self.teacher_entropy_beta = 1.0
+        self.teacher_vocab_size = None
         self_distillation_cfg = getattr(self.config, "self_distillation", None)
+        if self_distillation_cfg is not None:
+            self.contrastive_visual_advantage_enabled = bool(
+                self_distillation_cfg.get("contrastive_visual_advantage", False)
+            )
+            self.contrastive_negative_mode = self_distillation_cfg.get(
+                "contrastive_negative_mode", "complement-random-equal"
+            )
+            self.contrastive_negative_seed = int(
+                self_distillation_cfg.get("contrastive_negative_seed", 0)
+            )
+            self.teacher_entropy_reweighting_enabled = bool(
+                self_distillation_cfg.get("teacher_entropy_reweighting", False)
+            )
+            self.teacher_entropy_beta = float(self_distillation_cfg.get("teacher_entropy_beta", 1.0))
+            if not math.isfinite(self.teacher_entropy_beta) or self.teacher_entropy_beta < 0:
+                raise ValueError(
+                    "teacher_entropy_beta must be finite and non-negative, "
+                    f"got {self.teacher_entropy_beta}"
+                )
+            if self.teacher_entropy_reweighting_enabled and self.contrastive_visual_advantage_enabled:
+                raise ValueError(
+                    "teacher_entropy_reweighting and contrastive_visual_advantage are mutually exclusive"
+                )
+            if self.contrastive_visual_advantage_enabled and self_distillation_cfg.get(
+                "teacher_visual_token_mode", "crop"
+            ) != "same_image_bbox_mask":
+                raise ValueError(
+                    "contrastive_visual_advantage requires "
+                    "teacher_visual_token_mode='same_image_bbox_mask'"
+                )
+            if self.teacher_entropy_reweighting_enabled:
+                if self_distillation_cfg.get("teacher_visual_token_mode", "crop") != "same_image_bbox_mask":
+                    raise ValueError(
+                        "teacher_entropy_reweighting requires "
+                        "teacher_visual_token_mode='same_image_bbox_mask'"
+                    )
+                if self.config.policy_loss.get("loss_mode", "vanilla") != "vopd":
+                    raise ValueError("teacher_entropy_reweighting requires policy_loss.loss_mode='vopd'")
+                if self.config.loss_agg_mode != "token-mean":
+                    raise ValueError("teacher_entropy_reweighting requires actor.loss_agg_mode='token-mean'")
+                if self.config.entropy_coeff != 0:
+                    raise ValueError("teacher_entropy_reweighting requires actor.entropy_coeff=0")
+                if self.config.use_kl_loss:
+                    raise ValueError("teacher_entropy_reweighting requires actor.use_kl_loss=False")
+                self.teacher_vocab_size = self._resolve_actor_vocab_size()
         if (
             self_distillation_cfg is not None
             and self_distillation_cfg.get("teacher_visual_token_mode", "crop") == "same_image_bbox_mask"
@@ -142,6 +200,23 @@ class DataParallelPPOActor(BasePPOActor):
                 "teacher_visual_token_selection_strategy", "fixed_stratified"
             )
             strategy_kwargs = self_distillation_cfg.get("teacher_visual_token_selection_kwargs", {})
+            if self.contrastive_visual_advantage_enabled:
+                if strategy_name != "fixed_stratified":
+                    raise ValueError(
+                        "contrastive_visual_advantage requires "
+                        "teacher_visual_token_selection_strategy='fixed_stratified'"
+                    )
+                background_keep_ratio = float(strategy_kwargs.get("background_keep_ratio", 0.1))
+                if background_keep_ratio > 0.30:
+                    raise ValueError(
+                        "contrastive sparse teachers require background_keep_ratio <= 0.30, "
+                        f"got {background_keep_ratio}"
+                    )
+                if self.contrastive_negative_mode != "complement-random-equal":
+                    raise ValueError(
+                        "contrastive_negative_mode must be 'complement-random-equal', "
+                        f"got {self.contrastive_negative_mode!r}"
+                    )
             self.teacher_visual_token_selection_strategy = create_visual_token_selection_strategy(
                 strategy_name,
                 strategy_kwargs,
@@ -260,6 +335,25 @@ class DataParallelPPOActor(BasePPOActor):
             "vision_config.spatial_merge_size"
         )
 
+    def _resolve_actor_vocab_size(self) -> int:
+        candidates = [self.actor_module]
+        visited = set()
+        while candidates:
+            module = candidates.pop(0)
+            if module is None or id(module) in visited:
+                continue
+            visited.add(id(module))
+            config = getattr(module, "config", None)
+            text_config = getattr(config, "text_config", None)
+            vocab_size = getattr(text_config, "vocab_size", None) or getattr(config, "vocab_size", None)
+            if vocab_size is not None:
+                return int(vocab_size)
+            for attr_name in ("module", "_fsdp_wrapped_module", "base_model", "model"):
+                child = getattr(module, attr_name, None)
+                if child is not None and child is not module:
+                    candidates.append(child)
+        raise ValueError("Unable to resolve vocab_size from the actor model")
+
     @staticmethod
     def _as_per_sample_inputs(raw_multi_modal_inputs, batch_size: int, *, context: str) -> list[dict]:
         if raw_multi_modal_inputs is None:
@@ -322,6 +416,17 @@ class DataParallelPPOActor(BasePPOActor):
             metadata=normalized_metadata,
             valid_sequence_lengths=valid_sequence_lengths,
             spatial_merge_size=self.teacher_visual_spatial_merge_size,
+            contrastive_negative_mode=(
+                getattr(self, "contrastive_negative_mode", "complement-random-equal")
+                if getattr(self, "contrastive_visual_advantage_enabled", False)
+                else None
+            ),
+            contrastive_negative_seed=getattr(self, "contrastive_negative_seed", 0),
+            global_step=(
+                getattr(self, "_current_global_steps", None)
+                if getattr(self, "contrastive_visual_advantage_enabled", False)
+                else None
+            ),
         )
 
     @torch.no_grad()
@@ -329,6 +434,8 @@ class DataParallelPPOActor(BasePPOActor):
         self,
         teacher_inputs: dict,
         selection_result: Optional[VisualTokenSelectionResult],
+        *,
+        mask_kind: str = "positive",
     ) -> tuple[dict, dict[str, float]]:
         if selection_result is None:
             raise ValueError("Student forward did not produce a visual token selection result")
@@ -341,6 +448,14 @@ class DataParallelPPOActor(BasePPOActor):
                 "Visual token selection result must contain one entry per teacher sample, "
                 f"got batch={batch_size} and results={len(selection_result)}"
             )
+        if mask_kind == "positive":
+            selected_masks = selection_result.keep_masks
+        elif mask_kind == "negative":
+            if selection_result.negative_keep_masks is None:
+                raise ValueError("Visual token selection result does not contain negative keep masks")
+            selected_masks = selection_result.negative_keep_masks
+        else:
+            raise ValueError(f"mask_kind must be 'positive' or 'negative', got {mask_kind!r}")
 
         normalized_inputs = self._as_per_sample_inputs(
             teacher_inputs.get("multi_modal_inputs"),
@@ -357,11 +472,13 @@ class DataParallelPPOActor(BasePPOActor):
         background_token_count = 0
         kept_background_token_count = 0
 
-        for sample_idx, (inputs, keep_mask, target_keep_mask) in enumerate(
+        pair_overlap_count = 0
+        for sample_idx, (inputs, keep_mask, target_keep_mask, positive_keep_mask) in enumerate(
             zip(
                 normalized_inputs,
-                selection_result.keep_masks,
+                selected_masks,
                 selection_result.target_keep_masks,
+                selection_result.keep_masks,
                 strict=True,
             )
         ):
@@ -390,27 +507,43 @@ class DataParallelPPOActor(BasePPOActor):
             sample_kept_count = int(teacher_keep_mask.sum().item())
             target_token_count += sample_target_count
             background_token_count += sample_token_count - sample_target_count
-            kept_background_token_count += sample_kept_count - sample_target_count
+            if mask_kind == "positive":
+                kept_background_token_count += sample_kept_count - sample_target_count
+            else:
+                kept_background_token_count += sample_kept_count
+                pair_overlap_count += int(
+                    (teacher_keep_mask.to(device=positive_keep_mask.device) & positive_keep_mask).sum().item()
+                )
 
         finalized_teacher_inputs = dict(teacher_inputs)
         finalized_teacher_inputs["attention_mask"] = teacher_attention_mask
         finalized_teacher_inputs["multi_modal_inputs"] = finalized_multi_modal_inputs
         total_visual_tokens = target_token_count + background_token_count
         kept_visual_tokens = target_token_count + kept_background_token_count
-        metrics = {
-            "actor/teacher_target_visual_tokens": float(target_token_count),
-            "actor/teacher_background_visual_tokens": float(background_token_count),
-            "actor/teacher_kept_background_visual_tokens": float(kept_background_token_count),
-            "actor/teacher_kept_visual_tokens": float(kept_visual_tokens),
-            "actor/teacher_visual_keep_ratio": kept_visual_tokens / max(total_visual_tokens, 1),
-            "actor/teacher_llm_effective_tokens": float(teacher_attention_mask.sum().item()),
-        }
-        metrics.update(
-            {
-                f"actor/teacher_visual_strategy/{key}": float(value)
-                for key, value in selection_result.metrics.items()
+        if mask_kind == "positive":
+            metrics = {
+                "actor/teacher_target_visual_tokens": float(target_token_count),
+                "actor/teacher_background_visual_tokens": float(background_token_count),
+                "actor/teacher_kept_background_visual_tokens": float(kept_background_token_count),
+                "actor/teacher_kept_visual_tokens": float(kept_visual_tokens),
+                "actor/teacher_visual_keep_ratio": kept_visual_tokens / max(total_visual_tokens, 1),
+                "actor/teacher_llm_effective_tokens": float(teacher_attention_mask.sum().item()),
             }
-        )
+            metrics.update(
+                {
+                    f"actor/teacher_visual_strategy/{key}": float(value)
+                    for key, value in selection_result.metrics.items()
+                }
+            )
+        else:
+            metrics = {
+                "actor/negative_teacher_kept_visual_tokens": float(kept_background_token_count),
+                "actor/negative_teacher_visual_keep_ratio": (
+                    kept_background_token_count / max(total_visual_tokens, 1)
+                ),
+                "actor/negative_teacher_llm_effective_tokens": float(teacher_attention_mask.sum().item()),
+                "actor/teacher_visual_pair_overlap": float(pair_overlap_count),
+            }
         return finalized_teacher_inputs, metrics
 
     @staticmethod
@@ -1074,9 +1207,17 @@ class DataParallelPPOActor(BasePPOActor):
 
         self_distillation_enabled = loss_mode == "vopd"
         self_distillation_cfg = getattr(self.config, "self_distillation", None)
+        contrastive_visual_advantage_enabled = False
+        teacher_entropy_reweighting_enabled = False
         if self_distillation_enabled:
             if self_distillation_cfg is None:
                 raise ValueError(f"loss_mode={loss_mode} requires actor.self_distillation config.")
+            contrastive_visual_advantage_enabled = bool(
+                self_distillation_cfg.get("contrastive_visual_advantage", False)
+            )
+            teacher_entropy_reweighting_enabled = bool(
+                self_distillation_cfg.get("teacher_entropy_reweighting", False)
+            )
             self_distillation_required_keys = {
                 "teacher_input_ids",
                 "teacher_attention_mask",
@@ -1155,9 +1296,47 @@ class DataParallelPPOActor(BasePPOActor):
                 "timing_s/update_actor/optimizer_step": 0.0,
                 "timing_s/update_actor/teacher_ema_update": 0.0,
             }
+            if contrastive_visual_advantage_enabled:
+                stage_wall_time_totals["timing_s/update_actor/negative_teacher_forward"] = 0.0
         did_update = False
         for _ in range(self.config.ppo_epochs):
             for batch_idx, mini_batch in enumerate(mini_batches):
+                entropy_weight_accumulator = None
+                token_weight_metrics_accumulator = None
+                entropy_loss_metric_starts = None
+                if teacher_entropy_reweighting_enabled or contrastive_visual_advantage_enabled:
+                    mini_distillation_mask = mini_batch.batch["self_distillation_mask"]
+                    if teacher_entropy_reweighting_enabled and not torch.all(
+                        mini_distillation_mask > 0.5
+                    ).item():
+                        raise ValueError(
+                            "teacher_entropy_reweighting requires every optimizer mini-batch sample "
+                            "to be routed to SDPO; GRPO fallback is not supported"
+                        )
+                    mini_loss_mask = mini_batch.batch["response_mask"] * mini_distillation_mask.unsqueeze(1)
+                    global_token_count = global_valid_token_count(
+                        mini_loss_mask,
+                        reduction_device=get_device_id(),
+                    )
+                    token_weight_mode = (
+                        "teacher_entropy" if teacher_entropy_reweighting_enabled else "visual_advantage"
+                    )
+                    sample_seed = int(self._current_global_steps or 0) * 100003 + batch_idx
+                    token_weight_metrics_accumulator = DistillationTokenWeightMetricsAccumulator(
+                        mode=token_weight_mode,
+                        global_token_count=global_token_count,
+                        sample_seed=sample_seed,
+                        vocab_size=self.teacher_vocab_size if teacher_entropy_reweighting_enabled else None,
+                    )
+                if teacher_entropy_reweighting_enabled:
+                    entropy_weight_accumulator = TeacherEntropyWeightAccumulator(
+                        beta=self.teacher_entropy_beta,
+                        global_token_count=global_token_count,
+                    )
+                    entropy_loss_metric_starts = {
+                        key: metrics[key]
+                        for key in ("actor/pg_loss", "actor/vopd_loss", "actor/vopd_loss_weighted")
+                    }
                 if self.config.use_dynamic_bsz:
                     max_token_len = self.config.ppo_max_token_len_per_gpu * self.ulysses_sequence_parallel_size
                     micro_batches, _ = prepare_dynamic_batch(mini_batch, max_token_len=max_token_len)
@@ -1191,7 +1370,9 @@ class DataParallelPPOActor(BasePPOActor):
                             policy_fallback_mask.float().mean().detach().item()
                         )
 
-                    if self.config.use_dynamic_bsz:
+                    if teacher_entropy_reweighting_enabled:
+                        loss_scale_factor = 1.0
+                    elif self.config.use_dynamic_bsz:
                         loss_scale_factor = response_mask.shape[0] / self.config.ppo_mini_batch_size
                     else:
                         loss_scale_factor = 1 / self.gradient_accumulation
@@ -1294,7 +1475,7 @@ class DataParallelPPOActor(BasePPOActor):
                             teacher_outputs = self._forward_micro_batch(
                                 teacher_inputs,
                                 temperature=temperature,
-                                calculate_entropy=False,
+                                calculate_entropy=teacher_entropy_reweighting_enabled,
                                 return_all_logps=return_all_logps,
                                 distill_topk=distill_topk,
                                 topk_indices=student_topk_indices,
@@ -1305,6 +1486,59 @@ class DataParallelPPOActor(BasePPOActor):
                         teacher_log_prob = teacher_outputs["log_probs"]
                         teacher_all_logps = teacher_outputs.get("all_logps") if return_all_logps else None
                         teacher_topk_logps = teacher_outputs.get("topk_logps") if distill_topk else None
+                        distillation_token_weights = None
+                        distillation_token_weight_mode = None
+                        distillation_token_weight_source = None
+                        negative_teacher_log_prob = None
+                        if contrastive_visual_advantage_enabled:
+                            negative_teacher_inputs = {
+                                "responses": model_inputs["responses"],
+                                "input_ids": model_inputs["teacher_input_ids"],
+                                "attention_mask": model_inputs["teacher_attention_mask"],
+                                "position_ids": model_inputs["teacher_position_ids"],
+                                "response_start_idx": model_inputs["teacher_response_start_idx"],
+                                "multi_modal_inputs": model_inputs["multi_modal_inputs"],
+                            }
+                            negative_teacher_inputs, negative_selection_metrics = (
+                                self._finalize_teacher_visual_token_mask(
+                                    negative_teacher_inputs,
+                                    visual_token_selection_result,
+                                    mask_kind="negative",
+                                )
+                            )
+                            micro_batch_metrics.update(negative_selection_metrics)
+                            with torch.no_grad():
+                                negative_teacher_forward_start = time.perf_counter()
+                                negative_teacher_outputs = self._forward_micro_batch(
+                                    negative_teacher_inputs,
+                                    temperature=temperature,
+                                    calculate_entropy=False,
+                                    return_all_logps=False,
+                                    distill_topk=None,
+                                    module=teacher_model,
+                                )
+                                negative_teacher_forward_time = (
+                                    time.perf_counter() - negative_teacher_forward_start
+                                )
+                            stage_wall_time_totals[
+                                "timing_s/update_actor/negative_teacher_forward"
+                            ] += negative_teacher_forward_time
+                            negative_teacher_log_prob = negative_teacher_outputs["log_probs"]
+                            visual_advantage_margin = (teacher_log_prob - negative_teacher_log_prob).detach()
+                            distillation_token_weights = torch.relu(visual_advantage_margin)
+                            distillation_token_weight_mode = "visual_advantage"
+                            distillation_token_weight_source = visual_advantage_margin
+                        elif teacher_entropy_reweighting_enabled:
+                            teacher_entropy = teacher_outputs.get("entropys")
+                            if teacher_entropy is None:
+                                raise ValueError("Positive teacher forward did not return entropy")
+                            entropy_loss_mask = response_mask * self_distillation_mask.unsqueeze(1)
+                            distillation_token_weights = entropy_weight_accumulator.add(
+                                teacher_entropy,
+                                entropy_loss_mask,
+                            )
+                            distillation_token_weight_mode = "teacher_entropy"
+                            distillation_token_weight_source = teacher_entropy.detach()
                         if self_distillation_cfg.get("log_prob_dump_dir", None):
                             if distill_topk:
                                 student_distill_log_probs = student_topk_logps
@@ -1348,12 +1582,33 @@ class DataParallelPPOActor(BasePPOActor):
                             student_topk_log_probs=student_topk_logps,
                             teacher_topk_log_probs=teacher_topk_logps,
                             self_distillation_mask=self_distillation_mask,
+                            distillation_token_weights=distillation_token_weights,
+                            distillation_token_weight_mode=distillation_token_weight_mode,
+                            distillation_token_weight_source=distillation_token_weight_source,
+                            distillation_token_weight_metrics_accumulator=token_weight_metrics_accumulator,
+                            positive_teacher_log_probs=(
+                                teacher_log_prob if contrastive_visual_advantage_enabled else None
+                            ),
+                            negative_teacher_log_probs=negative_teacher_log_prob,
                             loss_agg_mode=loss_agg_mode,
                             rollout_is_weights=rollout_is_weights,
-                            batch_num_tokens=self.config.global_batch_info.get("batch_num_tokens"),
+                            dp_size=(
+                                entropy_weight_accumulator.dp_size
+                                if teacher_entropy_reweighting_enabled
+                                else 1
+                            ),
+                            batch_num_tokens=(
+                                entropy_weight_accumulator.global_token_count
+                                if teacher_entropy_reweighting_enabled
+                                else self.config.global_batch_info.get("batch_num_tokens")
+                            ),
                             global_batch_size=self.config.global_batch_info.get("global_batch_size"),
                             loss_scale_factor=self.config.global_batch_info.get("loss_scale_factor"),
                         )
+                        if teacher_entropy_reweighting_enabled:
+                            entropy_weight_accumulator.add_weighted_loss_sum(
+                                vopd_metrics.pop("_self_distillation/entropy_weighted_loss_sum")
+                            )
                         loss_compute_time = time.perf_counter() - loss_compute_start
                         stage_wall_time_totals["timing_s/update_actor/loss_compute"] += loss_compute_time
 
@@ -1456,6 +1711,20 @@ class DataParallelPPOActor(BasePPOActor):
                         if grpo_loss is not None:
                             metrics["actor/grpo_loss"] += grpo_loss.detach().item() * loss_scale_factor
                     append_to_dict(metrics, micro_batch_metrics)
+
+                if teacher_entropy_reweighting_enabled:
+                    normalization_scale, entropy_weight_metrics = entropy_weight_accumulator.finalize()
+                    scale_gradients_(self.actor_module.parameters(), normalization_scale)
+                    for key, start_value in entropy_loss_metric_starts.items():
+                        metrics[key] = start_value + (metrics[key] - start_value) * normalization_scale
+                    append_to_dict(metrics, entropy_weight_metrics)
+                else:
+                    normalization_scale = 1.0
+                if token_weight_metrics_accumulator is not None:
+                    token_weight_metrics = token_weight_metrics_accumulator.finalize(
+                        normalization_scale=normalization_scale
+                    )
+                    append_to_dict(metrics, token_weight_metrics)
 
                 optimizer_step_start = time.perf_counter()
                 grad_norm = self._optimizer_step()

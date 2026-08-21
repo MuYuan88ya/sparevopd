@@ -23,6 +23,7 @@ __all__ = ["register_adv_est", "get_adv_estimator_fn", "AdvantageEstimator"]
 from collections import defaultdict
 from enum import Enum
 from typing import Any, Callable, Optional
+
 import numpy as np
 import torch
 import torch.nn.functional as F
@@ -1093,8 +1094,15 @@ def compute_self_distillation_loss(
     student_topk_log_probs: Optional[torch.Tensor] = None,
     teacher_topk_log_probs: Optional[torch.Tensor] = None,
     self_distillation_mask: Optional[torch.Tensor] = None,
+    distillation_token_weights: Optional[torch.Tensor] = None,
+    distillation_token_weight_mode: Optional[str] = None,
+    distillation_token_weight_source: Optional[torch.Tensor] = None,
+    distillation_token_weight_metrics_accumulator: Optional[Any] = None,
+    positive_teacher_log_probs: Optional[torch.Tensor] = None,
+    negative_teacher_log_probs: Optional[torch.Tensor] = None,
     loss_agg_mode: str = "token-mean",
     rollout_is_weights: Optional[torch.Tensor] = None,
+    dp_size: int = 1,
     batch_num_tokens: Optional[int] = None,
     global_batch_size: Optional[int] = None,
     loss_scale_factor: Optional[int] = None,
@@ -1117,7 +1125,8 @@ def compute_self_distillation_loss(
                 # log(1 - sum(p_i)) = log(1 - exp(log_sum_exp(log(p_i))))
                 log_s = torch.logsumexp(log_probs, dim=-1, keepdim=True)
                 log_s = torch.clamp(log_s, max=-1e-7)  # Clamp to avoid log_s >= 0 (which implies sum(probs) >= 1)
-                tail_log = torch.log(-torch.expm1(log_s))  # We use the identity: 1 - exp(x) = -(exp(x) - 1); torch.expm1(x) computes (e^x - 1) with high precision for small x.
+                # 1 - exp(x) = -expm1(x), which is stable for x close to zero.
+                tail_log = torch.log(-torch.expm1(log_s))
                 return torch.cat([log_probs, tail_log], dim=-1)
 
             def renorm_topk_log_probs(logp: torch.Tensor) -> torch.Tensor:
@@ -1155,7 +1164,12 @@ def compute_self_distillation_loss(
                 device=student_distill_log_probs.device,
             )
             mixture_log_probs = torch.logsumexp(
-                torch.stack([student_distill_log_probs + torch.log(1 - alpha), teacher_distill_log_probs + torch.log(alpha)]),
+                torch.stack(
+                    [
+                        student_distill_log_probs + torch.log(1 - alpha),
+                        teacher_distill_log_probs + torch.log(alpha),
+                    ]
+                ),
                 dim=0,
             )
             kl_teacher = F.kl_div(mixture_log_probs, teacher_distill_log_probs, reduction="none", log_target=True)
@@ -1169,6 +1183,44 @@ def compute_self_distillation_loss(
         raw_per_token_loss = log_ratio.detach() * student_log_probs
 
     weighted_per_token_loss = raw_per_token_loss
+
+    if distillation_token_weights is not None:
+        valid_weight_modes = {"visual_advantage", "teacher_entropy"}
+        if distillation_token_weight_mode not in valid_weight_modes:
+            raise ValueError(
+                "distillation_token_weight_mode must be one of "
+                f"{sorted(valid_weight_modes)} when token weights are provided, "
+                f"got {distillation_token_weight_mode!r}"
+            )
+        if distillation_token_weights.shape != weighted_per_token_loss.shape:
+            raise ValueError(
+                "distillation_token_weights must match the response-token loss shape, "
+                f"got {tuple(distillation_token_weights.shape)} and {tuple(weighted_per_token_loss.shape)}"
+            )
+        distillation_token_weights = distillation_token_weights.detach().to(
+            device=weighted_per_token_loss.device,
+            dtype=weighted_per_token_loss.dtype,
+        )
+        if not torch.isfinite(distillation_token_weights).all().item():
+            raise ValueError("distillation_token_weights must be finite")
+        if torch.any(distillation_token_weights < 0):
+            raise ValueError("distillation_token_weights must be non-negative")
+        if distillation_token_weight_metrics_accumulator is not None:
+            if distillation_token_weight_source is None:
+                raise ValueError(
+                    "distillation_token_weight_source is required when collecting token weight metrics"
+                )
+            distillation_token_weight_metrics_accumulator.add(
+                token_weights=distillation_token_weights,
+                raw_per_token_loss=raw_per_token_loss,
+                loss_mask=loss_mask,
+                source_signal=distillation_token_weight_source,
+                positive_teacher_log_probs=positive_teacher_log_probs,
+                negative_teacher_log_probs=negative_teacher_log_probs,
+            )
+        weighted_per_token_loss = weighted_per_token_loss * distillation_token_weights
+    elif distillation_token_weight_mode is not None:
+        raise ValueError("distillation_token_weight_mode requires distillation_token_weights")
 
     is_clip = self_distillation_config.is_clip
     if is_clip is not None:
@@ -1193,16 +1245,58 @@ def compute_self_distillation_loss(
     metrics["self_distillation/weighted_jsd_token_mean"] = (
         verl_F.masked_sum(weighted_per_token_loss, loss_mask) / valid_token_count
     ).detach().item()
+    if distillation_token_weight_mode == "visual_advantage":
+        metrics["self_distillation/visual_advantage_token_mean"] = (
+            verl_F.masked_sum(distillation_token_weights, loss_mask) / valid_token_count
+        ).detach().item()
+        metrics["self_distillation/visual_advantage_nonzero_fraction"] = (
+            verl_F.masked_sum((distillation_token_weights > 0).to(loss_mask.dtype), loss_mask)
+            / valid_token_count
+        ).detach().item()
+        activated_mask = (distillation_token_weights > 0).to(loss_mask.dtype) * loss_mask
+        activated_token_count = activated_mask.sum().clamp(min=1.0)
+        metrics["self_distillation/visual_advantage_activated_weight_mean"] = (
+            verl_F.masked_sum(distillation_token_weights, activated_mask) / activated_token_count
+        ).detach().item()
+        metrics["self_distillation/visual_advantage_bucket_zero_fraction"] = (
+            verl_F.masked_sum((distillation_token_weights <= 0).to(loss_mask.dtype), loss_mask)
+            / valid_token_count
+        ).detach().item()
+        metrics["self_distillation/visual_advantage_bucket_small_fraction"] = (
+            verl_F.masked_sum(
+                ((distillation_token_weights > 0) & (distillation_token_weights <= 0.05)).to(loss_mask.dtype),
+                loss_mask,
+            )
+            / valid_token_count
+        ).detach().item()
+        metrics["self_distillation/visual_advantage_bucket_medium_fraction"] = (
+            verl_F.masked_sum(
+                ((distillation_token_weights > 0.05) & (distillation_token_weights <= 0.2)).to(loss_mask.dtype),
+                loss_mask,
+            )
+            / valid_token_count
+        ).detach().item()
+        metrics["self_distillation/visual_advantage_bucket_large_fraction"] = (
+            verl_F.masked_sum((distillation_token_weights > 0.2).to(loss_mask.dtype), loss_mask)
+            / valid_token_count
+        ).detach().item()
+    if distillation_token_weight_mode == "teacher_entropy":
+        metrics["_self_distillation/entropy_weighted_loss_sum"] = (
+            verl_F.masked_sum(weighted_per_token_loss, loss_mask).detach().item()
+        )
     if self_distillation_mask is None:
         metrics["self_distillation/self_distillation_mask.mean()"] = 1.0
     else:
-        metrics["self_distillation/self_distillation_mask.mean()"] = self_distillation_mask.float().mean().detach().item()
+        metrics["self_distillation/self_distillation_mask.mean()"] = (
+            self_distillation_mask.float().mean().detach().item()
+        )
     metrics["self_distillation/num_distill_tokens"] = loss_mask.sum().detach().item()
 
     loss = agg_loss(
         loss_mat=weighted_per_token_loss,
         loss_mask=loss_mask,
         loss_agg_mode=loss_agg_mode,
+        dp_size=dp_size,
         batch_num_tokens=batch_num_tokens,
         global_batch_size=global_batch_size,
         loss_scale_factor=loss_scale_factor,

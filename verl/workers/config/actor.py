@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import math
 from dataclasses import dataclass, field
 from typing import Any, Optional
 
@@ -54,16 +55,20 @@ class SelfDistillationConfig(BaseConfig):
         max_reprompt_len (int): Maximum length of the reprompted prompt.
         reprompt_truncation (str): Truncation method for the reprompted prompt (recommended to use "right" or "error").
         dont_reprompt_on_self_success (bool): Whether to not reprompt on self-success.
-        remove_thinking_from_demonstration (bool): Whether to remove <think>...</think> tags from successful demonstrations before reprompting.
+        remove_thinking_from_demonstration (bool): Whether to remove <think>...</think> tags from successful
+            demonstrations before reprompting.
         is_clip (Optional[float]): Clip value for distillation IS ratio; None disables IS weighting.
         reprompt_template (str): Template for reprompting. Uses {prompt}, {solution}, {feedback} placeholders.
-        solution_template (str): Template for formatting solution section. Uses {successful_previous_attempt} placeholder.
+        solution_template (str): Template for formatting solution section. Uses
+            {successful_previous_attempt} placeholder.
         feedback_template (str): Template for formatting feedback section. Uses {feedback_raw} placeholder.
         include_environment_feedback (bool): Whether to include environment feedback in reprompting for wrong attempts.
-        environment_feedback_only_without_solution (bool): If True, only use feedback when no solution is available (ignore feedback when solution exists).
+        environment_feedback_only_without_solution (bool): If True, only use feedback when no solution is
+            available (ignore feedback when solution exists).
         reprompt_template_feedback (str): Template for reprompting with feedback but no solution.
         reprompt_template_feedback_solution (str): Template for reprompting with both feedback and solution.
-        teacher_always_on (bool): Whether to distill every sample directly from a teacher input instead of selecting successful samples by reward.
+        teacher_always_on (bool): Whether to distill every sample directly from a teacher input instead of
+            selecting successful samples by reward.
         teacher_model_source (str): Teacher source. Options: "legacy", "current" or "fixed".
         teacher_model_path (Optional[str]): Fixed teacher model path when teacher_model_source="fixed".
         teacher_image_key (Optional[str]): Dataset column holding teacher-side images for multimodal distillation.
@@ -71,9 +76,16 @@ class SelfDistillationConfig(BaseConfig):
         teacher_bbox_key (str): Dataset column holding source-image bounding boxes.
         teacher_visual_token_selection_strategy (str): Registered strategy used to select teacher image tokens.
         teacher_visual_token_selection_kwargs (dict[str, Any]): Keyword arguments passed to the strategy factory.
+        contrastive_visual_advantage (bool): Whether to weight positive-teacher distillation with a paired
+            negative sparse-visual teacher.
+        contrastive_negative_mode (str): Negative visual token construction mode.
+        contrastive_negative_seed (int): Base seed for deterministic per-sample, per-step negative masks.
+        teacher_entropy_reweighting (bool): Whether to weight distillation tokens using positive-teacher entropy.
+        teacher_entropy_beta (float): Non-negative sensitivity of entropy-derived confidence weights.
         fallback_to_policy_loss_on_missing_teacher (bool): When teacher_always_on=True, fall back to vanilla
             policy loss for samples whose teacher_image_key column is empty.
-        log_prob_dump_dir (Optional[str]): Optional directory used to dump student/teacher log-prob tensors for each step.
+        log_prob_dump_dir (Optional[str]): Optional directory used to dump student/teacher log-prob tensors for
+            each step.
     """
 
     full_logit_distillation: bool = True
@@ -116,6 +128,11 @@ class SelfDistillationConfig(BaseConfig):
     teacher_visual_token_selection_kwargs: dict[str, Any] = field(
         default_factory=lambda: {"background_keep_ratio": 0.1, "seed": 0}
     )
+    contrastive_visual_advantage: bool = False
+    contrastive_negative_mode: str = "complement-random-equal"
+    contrastive_negative_seed: int = 0
+    teacher_entropy_reweighting: bool = False
+    teacher_entropy_beta: float = 1.0
     teacher_prompt_mode: Optional[str] = None
     answer_hint_template: str = (
         "\n\nHere is a reference solution to this problem:\n"
@@ -174,6 +191,51 @@ class SelfDistillationConfig(BaseConfig):
             raise ValueError("same_image_bbox_mask cannot be combined with teacher_prompt_mode")
         if sparse_same_image and self.fallback_to_policy_loss_on_missing_teacher:
             raise ValueError("same_image_bbox_mask requires bbox metadata for every sample and cannot use fallback")
+        if isinstance(self.teacher_entropy_beta, bool) or not isinstance(self.teacher_entropy_beta, (int, float)):
+            raise TypeError("self_distillation.teacher_entropy_beta must be numeric")
+        if not math.isfinite(float(self.teacher_entropy_beta)) or self.teacher_entropy_beta < 0:
+            raise ValueError(
+                "self_distillation.teacher_entropy_beta must be finite and non-negative, "
+                f"got {self.teacher_entropy_beta}"
+            )
+        if self.teacher_entropy_reweighting and self.contrastive_visual_advantage:
+            raise ValueError(
+                "self_distillation.teacher_entropy_reweighting and contrastive_visual_advantage "
+                "are mutually exclusive"
+            )
+        if self.teacher_entropy_reweighting and not sparse_same_image:
+            raise ValueError(
+                "self_distillation.teacher_entropy_reweighting requires "
+                "teacher_visual_token_mode='same_image_bbox_mask'"
+            )
+        if self.contrastive_visual_advantage:
+            if not sparse_same_image:
+                raise ValueError(
+                    "self_distillation.contrastive_visual_advantage requires "
+                    "teacher_visual_token_mode='same_image_bbox_mask'"
+                )
+            if self.teacher_visual_token_selection_strategy != "fixed_stratified":
+                raise ValueError(
+                    "self_distillation.contrastive_visual_advantage currently requires "
+                    "teacher_visual_token_selection_strategy='fixed_stratified'"
+                )
+            if self.contrastive_negative_mode != "complement-random-equal":
+                raise ValueError(
+                    "self_distillation.contrastive_negative_mode must be 'complement-random-equal', "
+                    f"got {self.contrastive_negative_mode!r}"
+                )
+            background_keep_ratio = self.teacher_visual_token_selection_kwargs.get(
+                "background_keep_ratio", 0.1
+            )
+            if not isinstance(background_keep_ratio, (int, float)) or isinstance(background_keep_ratio, bool):
+                raise TypeError(
+                    "teacher_visual_token_selection_kwargs.background_keep_ratio must be numeric"
+                )
+            if float(background_keep_ratio) > 0.30:
+                raise ValueError(
+                    "contrastive sparse teachers require background_keep_ratio <= 0.30, "
+                    f"got {background_keep_ratio}"
+                )
         if (
             self.teacher_always_on
             and not sparse_same_image
@@ -374,6 +436,15 @@ class ActorConfig(BaseConfig):
         ]
         if self.loss_agg_mode not in valid_loss_agg_modes:
             raise ValueError(f"Invalid loss_agg_mode: {self.loss_agg_mode}")
+        if self.self_distillation.teacher_entropy_reweighting:
+            if self.policy_loss.loss_mode != "vopd":
+                raise ValueError("teacher_entropy_reweighting requires policy_loss.loss_mode='vopd'")
+            if self.loss_agg_mode != "token-mean":
+                raise ValueError("teacher_entropy_reweighting requires actor.loss_agg_mode='token-mean'")
+            if self.entropy_coeff != 0:
+                raise ValueError("teacher_entropy_reweighting requires actor.entropy_coeff=0")
+            if self.use_kl_loss:
+                raise ValueError("teacher_entropy_reweighting requires actor.use_kl_loss=False")
 
     def validate(self, n_gpus: int, train_batch_size: int, model_config: dict = None):
         """Validate actor configuration with runtime parameters."""

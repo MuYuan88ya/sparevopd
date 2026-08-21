@@ -22,6 +22,9 @@ def make_session(
     sample_id=1234,
     bbox=(20, 30, 40, 50),
     valid_sequence_lengths=(104,),
+    contrastive=False,
+    contrastive_negative_seed=0,
+    global_step=0,
 ):
     return VisualTokenSelectionSession(
         strategy=strategy or create_visual_token_selection_strategy("fixed_stratified"),
@@ -35,6 +38,9 @@ def make_session(
         ),
         valid_sequence_lengths=valid_sequence_lengths,
         spatial_merge_size=2,
+        contrastive_negative_mode="complement-random-equal" if contrastive else None,
+        contrastive_negative_seed=contrastive_negative_seed,
+        global_step=global_step if contrastive else None,
     )
 
 
@@ -224,6 +230,7 @@ def test_session_is_single_use_and_result_retains_only_compact_fields():
         "target_keep_masks",
         "sample_ids",
         "metrics",
+        "negative_keep_masks",
     ]
     assert all(mask.numel() == 100 for mask in (*result.keep_masks, *result.target_keep_masks))
     with pytest.raises(RuntimeError, match="only be executed once"):
@@ -233,6 +240,66 @@ def test_session_is_single_use_and_result_retains_only_compact_fields():
             image_mask=torch.ones((1, 104), dtype=torch.bool),
             image_grid_thw=torch.tensor([[1, 20, 20]]),
         )
+
+
+def test_contrastive_negative_mask_is_disjoint_equal_size_and_excludes_target():
+    result = execute_single(
+        make_session(
+            strategy=create_visual_token_selection_strategy(
+                "fixed_stratified", {"background_keep_ratio": 0.3, "seed": 7}
+            ),
+            contrastive=True,
+            contrastive_negative_seed=11,
+            global_step=23,
+        )
+    )
+    positive_mask = result.keep_masks[0]
+    negative_mask = result.negative_keep_masks[0]
+    target_mask = result.target_keep_masks[0].to(negative_mask.device)
+
+    assert int(positive_mask.sum()) == int(negative_mask.sum())
+    assert not torch.any(positive_mask & negative_mask)
+    assert not torch.any(target_mask & negative_mask)
+    assert torch.all(negative_mask <= ~positive_mask)
+
+
+def test_contrastive_negative_mask_is_stable_within_step_and_changes_across_context():
+    def select(*, sample_id="sample", global_step=10, seed=3):
+        return execute_single(
+            make_session(
+                sample_id=sample_id,
+                contrastive=True,
+                contrastive_negative_seed=seed,
+                global_step=global_step,
+            )
+        ).negative_keep_masks[0]
+
+    reference = select()
+    assert torch.equal(reference, select())
+    assert not torch.equal(reference, select(global_step=11))
+    assert not torch.equal(reference, select(sample_id="other"))
+    assert not torch.equal(reference, select(seed=4))
+
+
+def test_contrastive_session_requires_global_step():
+    with pytest.raises(ValueError, match="requires a global_step"):
+        make_session(contrastive=True, global_step=None)
+
+
+def test_contrastive_negative_mask_rejects_insufficient_complement_with_counts():
+    session = make_session(
+        strategy=create_visual_token_selection_strategy(
+            "fixed_stratified", {"background_keep_ratio": 0.3, "seed": 0}
+        ),
+        bbox=(0, 0, 80, 80),
+        contrastive=True,
+        global_step=1,
+    )
+    with pytest.raises(
+        ValueError,
+        match=r"sample_id=1234.*total_tokens=100.*bbox_tokens=64.*positive_tokens=75.*complement_tokens=25",
+    ):
+        execute_single(session)
 
 
 class InvalidOutputStrategy(VisualTokenSelectionStrategy):

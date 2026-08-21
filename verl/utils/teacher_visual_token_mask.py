@@ -45,11 +45,14 @@ class VisualTokenSelectionResult:
     target_keep_masks: tuple[torch.BoolTensor, ...]
     sample_ids: tuple[Any, ...]
     metrics: dict[str, float]
+    negative_keep_masks: tuple[torch.BoolTensor, ...] | None = None
 
     def __post_init__(self) -> None:
         sample_count = len(self.keep_masks)
         if len(self.target_keep_masks) != sample_count or len(self.sample_ids) != sample_count:
             raise ValueError("Visual token selection result fields must have the same sample count")
+        if self.negative_keep_masks is not None and len(self.negative_keep_masks) != sample_count:
+            raise ValueError("Negative visual token masks must have the same sample count as positive masks")
         for sample_idx, (keep_mask, target_keep_mask) in enumerate(
             zip(self.keep_masks, self.target_keep_masks, strict=True)
         ):
@@ -65,6 +68,25 @@ class VisualTokenSelectionResult:
                 raise ValueError("visual token selection masks must not require gradients")
             if torch.any(target_keep_mask.to(device=keep_mask.device) & ~keep_mask):
                 raise ValueError(f"keep_masks[{sample_idx}] dropped a target token")
+            if self.negative_keep_masks is None:
+                continue
+
+            negative_keep_mask = self.negative_keep_masks[sample_idx]
+            if not isinstance(negative_keep_mask, torch.Tensor):
+                raise TypeError(f"negative_keep_masks[{sample_idx}] must be a torch tensor")
+            if negative_keep_mask.ndim != 1 or negative_keep_mask.dtype != torch.bool:
+                raise ValueError(f"negative_keep_masks[{sample_idx}] must be a rank-1 bool tensor")
+            if negative_keep_mask.shape != keep_mask.shape:
+                raise ValueError(f"positive and negative masks[{sample_idx}] must have the same shape")
+            if negative_keep_mask.requires_grad:
+                raise ValueError("negative visual token selection masks must not require gradients")
+            negative_on_keep_device = negative_keep_mask.to(device=keep_mask.device)
+            if torch.any(keep_mask & negative_on_keep_device):
+                raise ValueError(f"positive and negative masks[{sample_idx}] must not overlap")
+            if int(keep_mask.sum().item()) != int(negative_keep_mask.sum().item()):
+                raise ValueError(f"positive and negative masks[{sample_idx}] must keep the same token count")
+            if torch.any(target_keep_mask.to(device=negative_keep_mask.device) & negative_keep_mask):
+                raise ValueError(f"negative_keep_masks[{sample_idx}] retained a target token")
 
     def __len__(self) -> int:
         return len(self.keep_masks)
@@ -135,6 +157,9 @@ class VisualTokenSelectionSession:
         metadata: Sequence[Mapping[str, Any]],
         valid_sequence_lengths: Sequence[int],
         spatial_merge_size: int,
+        contrastive_negative_mode: str | None = None,
+        contrastive_negative_seed: int = 0,
+        global_step: int | None = None,
     ) -> None:
         if not isinstance(strategy, VisualTokenSelectionStrategy):
             raise TypeError(f"strategy must be a VisualTokenSelectionStrategy, got {type(strategy)}")
@@ -142,6 +167,9 @@ class VisualTokenSelectionSession:
         self._metadata = tuple(dict(item) for item in metadata)
         self._valid_sequence_lengths = tuple(int(length) for length in valid_sequence_lengths)
         self._spatial_merge_size = int(spatial_merge_size)
+        self._contrastive_negative_mode = contrastive_negative_mode
+        self._contrastive_negative_seed = int(contrastive_negative_seed)
+        self._global_step = None if global_step is None else int(global_step)
         self._started = False
         self._result: VisualTokenSelectionResult | None = None
 
@@ -156,6 +184,13 @@ class VisualTokenSelectionSession:
             raise ValueError(f"valid sequence lengths must be positive, got {self._valid_sequence_lengths}")
         if self._spatial_merge_size <= 0:
             raise ValueError(f"spatial_merge_size must be positive, got {self._spatial_merge_size}")
+        if self._contrastive_negative_mode not in (None, "complement-random-equal"):
+            raise ValueError(
+                "contrastive_negative_mode must be 'complement-random-equal' when enabled, "
+                f"got {self._contrastive_negative_mode!r}"
+            )
+        if self._contrastive_negative_mode is not None and self._global_step is None:
+            raise ValueError("Contrastive visual token selection requires a global_step")
 
     @torch.no_grad()
     def execute(
@@ -178,7 +213,14 @@ class VisualTokenSelectionSession:
             metadata=self._metadata,
             spatial_merge_size=self._spatial_merge_size,
         )
-        self._result = self._strategy.select_batch(batch)
+        result = self._strategy.select_batch(batch)
+        if self._contrastive_negative_mode is not None:
+            result = _add_complement_random_equal_masks(
+                result,
+                global_step=self._global_step,
+                seed=self._contrastive_negative_seed,
+            )
+        self._result = result
 
     @property
     def result(self) -> VisualTokenSelectionResult:
@@ -395,6 +437,12 @@ def _stable_sample_seed(sample_id: Any, seed: int) -> int:
     return int.from_bytes(digest, byteorder="little") & _INT63_MASK
 
 
+def _stable_contrastive_seed(sample_id: Any, global_step: int, seed: int) -> int:
+    payload = f"{sample_id}|{global_step}|{seed}".encode()
+    digest = hashlib.blake2b(payload, digest_size=8).digest()
+    return int.from_bytes(digest, byteorder="little") & _INT63_MASK
+
+
 def _spread_morton_bits(values: torch.Tensor) -> torch.Tensor:
     values = values & 0xFFFF
     values = (values | (values << 8)) & 0x00FF00FF
@@ -414,6 +462,50 @@ def _stateless_stratum_hash(strata: torch.Tensor, sample_seed: int) -> torch.Ten
     values = values ^ (values >> 27)
     values = (values * 0x14D049BB133111EB) & _INT63_MASK
     return values ^ (values >> 31)
+
+
+def _add_complement_random_equal_masks(
+    result: VisualTokenSelectionResult,
+    *,
+    global_step: int | None,
+    seed: int,
+) -> VisualTokenSelectionResult:
+    if global_step is None:
+        raise ValueError("Contrastive visual token selection requires a global_step")
+
+    negative_keep_masks: list[torch.BoolTensor] = []
+    for sample_idx, (positive_keep_mask, target_keep_mask, sample_id) in enumerate(
+        zip(result.keep_masks, result.target_keep_masks, result.sample_ids, strict=True)
+    ):
+        positive_count = int(positive_keep_mask.sum().item())
+        complement_indices = torch.nonzero(~positive_keep_mask, as_tuple=True)[0]
+        complement_count = int(complement_indices.numel())
+        if complement_count < positive_count:
+            target_count = int(target_keep_mask.sum().item())
+            raise ValueError(
+                "Cannot construct an equal-size disjoint negative visual-token mask: "
+                f"sample_id={sample_id!r}, total_tokens={positive_keep_mask.numel()}, "
+                f"bbox_tokens={target_count}, positive_tokens={positive_count}, "
+                f"complement_tokens={complement_count}. Reduce background_keep_ratio; "
+                "contrastive sparse teachers require background_keep_ratio <= 0.30 and "
+                "at least as many unselected tokens as selected tokens."
+            )
+
+        sample_seed = _stable_contrastive_seed(sample_id, global_step, seed)
+        candidate_hashes = _stateless_stratum_hash(complement_indices, sample_seed)
+        candidate_order = torch.argsort(candidate_hashes, stable=True)
+        selected_indices = complement_indices[candidate_order[:positive_count]]
+        negative_keep_mask = torch.zeros_like(positive_keep_mask)
+        negative_keep_mask.scatter_(0, selected_indices, True)
+        negative_keep_masks.append(negative_keep_mask.detach().clone())
+
+    return VisualTokenSelectionResult(
+        keep_masks=result.keep_masks,
+        target_keep_masks=result.target_keep_masks,
+        sample_ids=result.sample_ids,
+        metrics=result.metrics,
+        negative_keep_masks=tuple(negative_keep_masks),
+    )
 
 
 @register_visual_token_selection_strategy("fixed_stratified")

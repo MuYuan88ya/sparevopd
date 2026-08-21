@@ -49,6 +49,12 @@
 
 随后 actor 直接读取 session 的 compact result，用同一份 mask 修改教师 `attention_mask` 并写入教师多模态输入。教师 forward 仍在 actor 中先经过现有 `unpad_input`，再由 Qwen3.5 重新完成全图 ViT forward，并用 `image_token_keep_mask` 筛选进入教师 LLM 的视觉特征。这样策略只负责单样本选择，batch 对齐、attention-mask/unpadding 和视觉特征过滤各自只有一条实现路径。
 
+可选的 `contrastive_visual_advantage` 在同一个 session 中为每个正教师 mask 构造等量且完全不重叠的负教师 mask。负 mask 只从正教师未选择的视觉 Token 中抽样，并由样本编号、训练步和独立 seed 确定；正、负教师使用相同模型参数、原图、文本和学生回答。负教师只评价学生实际生成 Token 的 log-prob，逐 Token 权重为 `max(0, logp_positive - logp_negative)`，并只加权正教师到学生的蒸馏损失。该功能默认关闭，启用时背景保留比例不得超过 30%，且每个样本的未选 Token 数必须足以构造等长负 mask。
+
+另一种互斥模式 `teacher_entropy_reweighting` 只使用正教师，根据完整词表熵构造 `exp(-beta * teacher_entropy)` 置信度，并在一次 optimizer mini-batch 的全部数据并行 rank 和 micro-batch 上归一化为均值 1。实现只跨 micro-batch 累计少量 detached 标量，在梯度裁剪前统一缩放梯度，不保留 Teacher logits 或 entropy 计算图，也不增加模型 forward。
+
+两种逐 Token 加权模式都会输出全局 optimizer mini-batch 级别的权重分布、有效 Token 比例、权重与原始 JSD 关系及模式专用指标。精确统计仅累计标量；分位数和 top-weight 指标使用最多 2048 个 detached Token 标量的确定性样本，不保存跨训练步历史。指标定义见 `docs/distillation_token_weight_metrics.md`。
+
 当前 `fixed_stratified` 策略按照 Morton 空间顺序分层并确定性抽样。学生 embedding 已经进入策略接口并完成形状与 batch 对齐检查，但当前策略不读取 embedding 数值进行排序。因此现阶段不能将方法描述为 embedding-similarity selection；这次改动建立的是后续特征选择实验所需的平台和正确时序。
 
 ## 研究表述

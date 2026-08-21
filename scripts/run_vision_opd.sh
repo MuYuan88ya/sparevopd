@@ -19,6 +19,38 @@ TEACHER_REGULARIZATION="ema"
 TEACHER_UPDATE_RATE=0.05
 TEACHER_VISUAL_TOKEN_MODE="same_image_bbox_mask"
 
+# Distillation token reweighting: none | contrastive | entropy.
+#
+# contrastive: compare equal-sized, disjoint positive/negative sparse teachers.
+# entropy:     reweight tokens by the positive teacher's full-vocabulary entropy.
+# The two methods are mutually exclusive by construction.
+DISTILLATION_TOKEN_WEIGHT_MODE="${DISTILLATION_TOKEN_WEIGHT_MODE:-none}"
+TEACHER_BACKGROUND_KEEP_RATIO="${TEACHER_BACKGROUND_KEEP_RATIO:-0.1}"
+TEACHER_VISUAL_SELECTION_SEED="${TEACHER_VISUAL_SELECTION_SEED:-0}"
+CONTRASTIVE_NEGATIVE_MODE="${CONTRASTIVE_NEGATIVE_MODE:-complement-random-equal}"
+CONTRASTIVE_NEGATIVE_SEED="${CONTRASTIVE_NEGATIVE_SEED:-0}"
+TEACHER_ENTROPY_BETA="${TEACHER_ENTROPY_BETA:-1.0}"
+
+case "$DISTILLATION_TOKEN_WEIGHT_MODE" in
+    none)
+        CONTRASTIVE_VISUAL_ADVANTAGE=False
+        TEACHER_ENTROPY_REWEIGHTING=False
+        ;;
+    contrastive)
+        CONTRASTIVE_VISUAL_ADVANTAGE=True
+        TEACHER_ENTROPY_REWEIGHTING=False
+        ;;
+    entropy)
+        CONTRASTIVE_VISUAL_ADVANTAGE=False
+        TEACHER_ENTROPY_REWEIGHTING=True
+        ;;
+    *)
+        echo "Invalid DISTILLATION_TOKEN_WEIGHT_MODE: $DISTILLATION_TOKEN_WEIGHT_MODE" >&2
+        echo "Expected one of: none, contrastive, entropy" >&2
+        exit 2
+        ;;
+esac
+
 TRAIN_BATCH_SIZE=96
 PPO_MIMI_BATCH_SIZE=96
 ROLLOUT_N=8
@@ -85,6 +117,13 @@ echo "Teacher model source: $TEACHER_MODEL_SOURCE"
 echo "Teacher regularization: $TEACHER_REGULARIZATION"
 echo "Teacher update rate: $TEACHER_UPDATE_RATE"
 echo "Teacher visual token mode: $TEACHER_VISUAL_TOKEN_MODE"
+echo "Distillation token weight mode: $DISTILLATION_TOKEN_WEIGHT_MODE"
+if [[ "$DISTILLATION_TOKEN_WEIGHT_MODE" == "contrastive" ]]; then
+    echo "Contrastive negative mode: $CONTRASTIVE_NEGATIVE_MODE"
+    echo "Contrastive negative seed: $CONTRASTIVE_NEGATIVE_SEED"
+elif [[ "$DISTILLATION_TOKEN_WEIGHT_MODE" == "entropy" ]]; then
+    echo "Teacher entropy beta: $TEACHER_ENTROPY_BETA"
+fi
 
 python3 -m verl.trainer.main_ppo --config-name "$CONFIG_NAME" \
     data.train_files="[\"$TASK_TRAIN_FILE\"]" \
@@ -113,6 +152,8 @@ python3 -m verl.trainer.main_ppo --config-name "$CONFIG_NAME" \
     actor_rollout_ref.actor.clip_ratio_high=0.3 \
     actor_rollout_ref.actor.clip_ratio_low=0.2 \
     actor_rollout_ref.actor.use_kl_loss=False \
+    actor_rollout_ref.actor.entropy_coeff=0 \
+    actor_rollout_ref.actor.loss_agg_mode=token-mean \
     actor_rollout_ref.actor.policy_loss.loss_mode=vopd \
     actor_rollout_ref.actor.calculate_entropy=False \
     actor_rollout_ref.actor.self_distillation.distillation_topk=100 \
@@ -125,8 +166,14 @@ python3 -m verl.trainer.main_ppo --config-name "$CONFIG_NAME" \
     actor_rollout_ref.actor.self_distillation.teacher_visual_token_mode=$TEACHER_VISUAL_TOKEN_MODE \
     actor_rollout_ref.actor.self_distillation.teacher_bbox_key=bbox \
     actor_rollout_ref.actor.self_distillation.teacher_visual_token_selection_strategy=fixed_stratified \
-    actor_rollout_ref.actor.self_distillation.teacher_visual_token_selection_kwargs.background_keep_ratio=0.1 \
-    actor_rollout_ref.actor.self_distillation.teacher_visual_token_selection_kwargs.seed=0 \
+    actor_rollout_ref.actor.self_distillation.teacher_visual_token_selection_kwargs.background_keep_ratio=$TEACHER_BACKGROUND_KEEP_RATIO \
+    actor_rollout_ref.actor.self_distillation.teacher_visual_token_selection_kwargs.seed=$TEACHER_VISUAL_SELECTION_SEED \
+    actor_rollout_ref.actor.self_distillation.contrastive_visual_advantage=$CONTRASTIVE_VISUAL_ADVANTAGE \
+    actor_rollout_ref.actor.self_distillation.contrastive_negative_mode=$CONTRASTIVE_NEGATIVE_MODE \
+    actor_rollout_ref.actor.self_distillation.contrastive_negative_seed=$CONTRASTIVE_NEGATIVE_SEED \
+    actor_rollout_ref.actor.self_distillation.teacher_entropy_reweighting=$TEACHER_ENTROPY_REWEIGHTING \
+    actor_rollout_ref.actor.self_distillation.teacher_entropy_beta=$TEACHER_ENTROPY_BETA \
+    actor_rollout_ref.actor.self_distillation.fallback_to_policy_loss_on_missing_teacher=False \
     algorithm.rollout_correction.rollout_is=token \
     algorithm.rollout_correction.rollout_is_threshold=2.0 \
     algorithm.adv_estimator=grpo \

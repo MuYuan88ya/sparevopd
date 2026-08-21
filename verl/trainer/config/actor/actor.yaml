@@ -156,6 +156,24 @@ self_distillation:
     background_keep_ratio: 0.1
     seed: 0
 
+  # Weight positive-teacher distillation with max(0, logp_positive - logp_negative)
+  # from an equal-size, disjoint sparse visual-token teacher.
+  contrastive_visual_advantage: False
+
+  # The negative teacher samples only from visual tokens omitted by the positive teacher.
+  contrastive_negative_mode: complement-random-equal
+
+  # Combined with sample id and global step for reproducible per-step negative masks.
+  contrastive_negative_seed: 0
+
+  # Reweight SDPO response tokens using exp(-beta * positive_teacher_entropy),
+  # normalized over the complete global optimizer mini-batch. Mutually exclusive
+  # with contrastive_visual_advantage.
+  teacher_entropy_reweighting: False
+
+  # Non-negative sensitivity of entropy-derived confidence weights. Zero gives unit weights.
+  teacher_entropy_beta: 1.0
+
   # Teacher prompt mode: null for SDPO (image swap), "answer_hint" for OPSD (text hint)
   teacher_prompt_mode: null
 

@@ -10,6 +10,10 @@ from verl.utils.teacher_visual_token_mask import (
 from verl.workers.actor.dp_actor import DataParallelPPOActor
 
 
+class AttrDict(dict):
+    __getattr__ = dict.__getitem__
+
+
 def make_tiny_qwen3_5():
     try:
         from transformers import Qwen3_5Config, Qwen3_5ForConditionalGeneration
@@ -51,12 +55,13 @@ def make_tiny_qwen3_5():
     )
 
 
-def make_actor(*, background_keep_ratio: float = 0.1) -> DataParallelPPOActor:
+def make_actor(*, background_keep_ratio: float = 0.1, contrastive: bool = False) -> DataParallelPPOActor:
     actor = DataParallelPPOActor.__new__(DataParallelPPOActor)
     actor.actor_module = SimpleNamespace(
         config=SimpleNamespace(
             image_token_id=99,
             vision_config=SimpleNamespace(spatial_merge_size=2),
+            text_config=SimpleNamespace(vocab_size=128),
         )
     )
     actor.teacher_visual_token_selection_strategy = create_visual_token_selection_strategy(
@@ -65,6 +70,10 @@ def make_actor(*, background_keep_ratio: float = 0.1) -> DataParallelPPOActor:
     )
     actor.teacher_visual_image_token_id = 99
     actor.teacher_visual_spatial_merge_size = 2
+    actor.contrastive_visual_advantage_enabled = contrastive
+    actor.contrastive_negative_mode = "complement-random-equal"
+    actor.contrastive_negative_seed = 0
+    actor._current_global_steps = 5
     return actor
 
 
@@ -151,6 +160,40 @@ def test_teacher_rejects_result_batch_mismatch():
         actor._finalize_teacher_visual_token_mask(teacher_inputs, invalid_result)
 
 
+def test_positive_and_negative_teachers_consume_equal_disjoint_masks():
+    actor = make_actor(background_keep_ratio=0.1, contrastive=True)
+    multi_modal_inputs, selection_metadata, teacher_inputs = make_inputs()
+    selection_metadata[1]["bbox"] = [0, 0, 1, 1]
+    result = execute_actor_session(actor, selection_metadata, teacher_inputs["attention_mask"])
+
+    positive_inputs, positive_metrics = actor._finalize_teacher_visual_token_mask(
+        teacher_inputs, result
+    )
+    negative_inputs, negative_metrics = actor._finalize_teacher_visual_token_mask(
+        teacher_inputs, result, mask_kind="negative"
+    )
+
+    assert all("image_token_keep_mask" not in inputs for inputs in multi_modal_inputs)
+    for positive_mask, negative_mask in zip(
+        result.keep_masks, result.negative_keep_masks, strict=True
+    ):
+        assert int(positive_mask.sum()) == int(negative_mask.sum())
+        assert not torch.any(positive_mask & negative_mask)
+    for sample_idx, response_start in enumerate(teacher_inputs["response_start_idx"].tolist()):
+        assert torch.equal(
+            positive_inputs["attention_mask"][sample_idx, response_start:],
+            teacher_inputs["attention_mask"][sample_idx, response_start:],
+        )
+        assert torch.equal(
+            negative_inputs["attention_mask"][sample_idx, response_start:],
+            teacher_inputs["attention_mask"][sample_idx, response_start:],
+        )
+    assert positive_metrics["actor/teacher_kept_visual_tokens"] == negative_metrics[
+        "actor/negative_teacher_kept_visual_tokens"
+    ]
+    assert negative_metrics["actor/teacher_visual_pair_overlap"] == 0.0
+
+
 def test_actor_session_builder_rejects_non_matrix_attention_mask():
     actor = make_actor()
     with pytest.raises(ValueError, match="attention_mask must have shape"):
@@ -160,19 +203,28 @@ def test_actor_session_builder_rejects_non_matrix_attention_mask():
         )
 
 
-def configure_full_actor(model, *, background_keep_ratio):
+def test_actor_resolves_nested_text_vocab_size_for_entropy_metrics():
+    actor = make_actor()
+    assert actor._resolve_actor_vocab_size() == 128
+
+
+def configure_full_actor(model, *, background_keep_ratio, contrastive=False):
     actor = DataParallelPPOActor.__new__(DataParallelPPOActor)
-    actor.config = {
+    actor.config = AttrDict({
         "calculate_sum_pi_squared": False,
         "sum_pi_squared_checkpointing": False,
         "entropy_checkpointing": False,
-    }
+    })
     actor.actor_module = model
     actor.teacher_visual_token_selection_strategy = create_visual_token_selection_strategy(
         "fixed_stratified", {"background_keep_ratio": background_keep_ratio, "seed": 0}
     )
     actor.teacher_visual_image_token_id = 99
     actor.teacher_visual_spatial_merge_size = 2
+    actor.contrastive_visual_advantage_enabled = contrastive
+    actor.contrastive_negative_mode = "complement-random-equal"
+    actor.contrastive_negative_seed = 0
+    actor._current_global_steps = 9
     actor.use_prefix_grouper = False
     actor.use_remove_padding = True
     actor.use_ulysses_sp = False
@@ -266,6 +318,76 @@ def test_full_student_session_to_teacher_flow(patch_qwen_and_unpadding):
     finalized_teacher_batch, _ = actor._finalize_teacher_visual_token_mask(teacher_batch, result)
     teacher_output = actor._forward_micro_batch(finalized_teacher_batch, temperature=1.0, module=model)
     assert teacher_output["log_probs"].shape == (2, 2)
+
+
+def test_full_student_to_positive_and_negative_teacher_flow(patch_qwen_and_unpadding):
+    model = make_tiny_qwen3_5().eval()
+    actor = configure_full_actor(model, background_keep_ratio=0.1, contrastive=True)
+    student_batch, metadata = make_full_flow_batch()
+    session = actor._build_visual_token_selection_session(metadata, student_batch["attention_mask"])
+    actor._forward_micro_batch(
+        student_batch,
+        temperature=1.0,
+        visual_token_selection_session=session,
+    )
+
+    teacher_batch = {
+        "input_ids": student_batch["input_ids"],
+        "attention_mask": student_batch["attention_mask"],
+        "position_ids": student_batch["position_ids"],
+        "response_start_idx": student_batch["response_start_idx"],
+        "responses": student_batch["responses"],
+        "multi_modal_inputs": [dict(inputs) for inputs in student_batch["multi_modal_inputs"]],
+    }
+    positive_batch, _ = actor._finalize_teacher_visual_token_mask(teacher_batch, session.result)
+    negative_batch, negative_metrics = actor._finalize_teacher_visual_token_mask(
+        teacher_batch,
+        session.result,
+        mask_kind="negative",
+    )
+    positive_output = actor._forward_micro_batch(positive_batch, temperature=1.0, module=model)
+    negative_output = actor._forward_micro_batch(negative_batch, temperature=1.0, module=model)
+
+    assert positive_output["log_probs"].shape == negative_output["log_probs"].shape == (2, 2)
+    assert negative_metrics["actor/teacher_visual_pair_overlap"] == 0.0
+
+
+def test_positive_teacher_entropy_uses_full_vocab_without_negative_mask(patch_qwen_and_unpadding):
+    import verl.utils.torch_functional as verl_F
+
+    model = make_tiny_qwen3_5().eval()
+    actor = configure_full_actor(model, background_keep_ratio=0.1, contrastive=False)
+    actor.teacher_entropy_reweighting_enabled = True
+    actor.compute_entropy_from_logits = verl_F.entropy_from_logits
+    student_batch, metadata = make_full_flow_batch()
+    session = actor._build_visual_token_selection_session(metadata, student_batch["attention_mask"])
+    actor._forward_micro_batch(
+        student_batch,
+        temperature=1.0,
+        visual_token_selection_session=session,
+    )
+    assert session.result.negative_keep_masks is None
+
+    teacher_batch = {
+        "input_ids": student_batch["input_ids"],
+        "attention_mask": student_batch["attention_mask"],
+        "position_ids": student_batch["position_ids"],
+        "response_start_idx": student_batch["response_start_idx"],
+        "responses": student_batch["responses"],
+        "multi_modal_inputs": [dict(inputs) for inputs in student_batch["multi_modal_inputs"]],
+    }
+    teacher_batch, _ = actor._finalize_teacher_visual_token_mask(teacher_batch, session.result)
+    output = actor._forward_micro_batch(
+        teacher_batch,
+        temperature=1.0,
+        calculate_entropy=True,
+        return_all_logps=True,
+        module=model,
+    )
+
+    direct_entropy = -(output["all_logps"].exp() * output["all_logps"]).sum(dim=-1)
+    assert output["entropys"].shape == (2, 2)
+    assert torch.allclose(output["entropys"], direct_entropy, atol=1e-6, rtol=1e-6)
 
 
 def test_full_keep_teacher_matches_dense_teacher_logits(patch_qwen_and_unpadding):

@@ -112,7 +112,29 @@ Launch Vision-OPD training:
 bash scripts/run_vision_opd.sh
 ```
 
-Key hyperparameters can be edited at the top of the script. See the script for the full configuration.
+The default `none` mode keeps the existing single-positive-teacher objective. Enable the equal-size positive/negative
+teacher weighting method with:
+
+```bash
+DISTILLATION_TOKEN_WEIGHT_MODE=contrastive \
+CONTRASTIVE_NEGATIVE_SEED=0 \
+bash scripts/run_vision_opd.sh
+```
+
+Enable positive-teacher entropy weighting with:
+
+```bash
+DISTILLATION_TOKEN_WEIGHT_MODE=entropy \
+TEACHER_ENTROPY_BETA=1.0 \
+bash scripts/run_vision_opd.sh
+```
+
+The two modes are mutually exclusive. `TEACHER_BACKGROUND_KEEP_RATIO` controls the positive teacher's sparse
+background ratio (default `0.1`); contrastive mode additionally supports `CONTRASTIVE_NEGATIVE_MODE` and
+`CONTRASTIVE_NEGATIVE_SEED`. Key hyperparameters can also be edited at the top of the script.
+When entropy or positive/negative teacher token weighting is enabled, the trainer reports global mini-batch weight
+distribution and supervision-quality metrics. See [`docs/distillation_token_weight_metrics.md`](docs/distillation_token_weight_metrics.md)
+for formulas and interpretation.
 
 ### 3. Merge Checkpoints
 
