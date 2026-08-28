@@ -190,6 +190,51 @@ def test_unified_judge_reuses_existing_results_and_scatters_outputs(tmp_path, mo
     assert [item["judge"] for item in zoom_results] == ["No", "Yes"]
 
 
+def test_original_eval_extracts_final_answer_without_reasoning_noise():
+    raw = "<think>I considered A and B.</think>\n<answer>C</answer>"
+    assert judge_qwenlm.extract_answer(raw) == "C"
+    assert judge_qwenlm.extract_answer("Answer: Blue") == "Blue"
+    assert judge_qwenlm.extract_answer("<answer>A</answer> then <answer>B</answer>") == "B"
+
+
+@pytest.mark.parametrize(
+    ("answer", "expected"),
+    [
+        ("The answer is (B).", "B"),
+        ("A is wrong. Final answer: B.", "B"),
+        ("答案是 c。", "C"),
+        ("A or B", ""),
+        ("The answer is A or B", ""),
+        ("Apple", ""),
+    ],
+)
+def test_original_eval_mcq_parser_requires_an_unambiguous_option(answer, expected):
+    assert judge_qwenlm.extract_first_option(answer) == expected
+
+
+def test_original_eval_binary_parsers_reject_ambiguous_answers():
+    assert judge_qwenlm.pope_extract("Yes, the object is visible.") == "yes"
+    assert judge_qwenlm.pope_extract("Yesterday was sunny.") == ""
+    assert judge_qwenlm.pope_extract("Yes or no cannot be determined.") == ""
+    assert judge_qwenlm.pope_extract("The answer is not yes.") == ""
+    assert judge_qwenlm.mmvp_extract("The answer is (b).") == "(b)"
+    assert judge_qwenlm.mmvp_extract("Either A or B") == ""
+
+
+def test_original_eval_judge_parser_returns_only_canonical_decisions():
+    assert judge_qwenlm.parse_judge_decision("Yes.") == "Yes"
+    assert judge_qwenlm.parse_judge_decision("<answer>No</answer>") == "No"
+    assert judge_qwenlm.parse_judge_decision("Yes or no") == ""
+    assert judge_qwenlm.parse_judge_decision("I cannot determine this") == ""
+
+
+def test_original_eval_rules_grade_unambiguous_wrong_mcq_without_judge():
+    item = {"query": "Pick one", "response": "(A)", "model_answer": "Final answer: B"}
+    assert judge_qwenlm.apply_rule_grading(item, "vstar", grade_answer=None) is None
+    assert item["judge"] == "No"
+    assert item["judge_source"] == "first letter"
+
+
 def test_accuracy_writes_machine_readable_metrics(tmp_path):
     judge_path = tmp_path / "judge.json"
     write_json(judge_path, [{"judge": "Yes"}, {"judge": "No"}])

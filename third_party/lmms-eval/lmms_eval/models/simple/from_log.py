@@ -12,16 +12,14 @@ import os
 import re
 from collections import defaultdict
 from pathlib import Path
-from typing import Any, List, Tuple
+from typing import Any
 
 from accelerate import Accelerator, DistributedType
-from loguru import logger as eval_logger
-from tqdm import tqdm
-
 from lmms_eval.api.instance import GenerationResult, Instance, TokenCounts
 from lmms_eval.api.model import lmms
 from lmms_eval.api.registry import register_model
-
+from loguru import logger as eval_logger
+from tqdm import tqdm
 
 _SAMPLE_LOG_PATTERN = re.compile(r"_samples_(?P<task>.+)\.jsonl$")
 _FAILURE_MARKERS = (
@@ -126,8 +124,7 @@ def load_jsonl_responses(log_roots: list[str], *, strict: bool = True) -> dict[s
                 previous = task_logs.get(normalized_doc_id)
                 if previous is not None and previous != responses:
                     eval_logger.warning(
-                        f"Replacing response for task={task!r}, doc_id={doc_id!r} "
-                        f"with newer record from {source}"
+                        f"Replacing response for task={task!r}, doc_id={doc_id!r} with newer record from {source}"
                     )
                 task_logs[normalized_doc_id] = responses
 
@@ -155,10 +152,7 @@ def _load_legacy_json_responses(log_roots: list[str]) -> dict[str, dict[str, lis
                     with path.open("r", encoding="utf-8") as handle:
                         data = json.load(handle)
                     task = str(data["model_configs"]["task"])
-                    task_logs = {
-                        str(item["doc_id"]): _normalize_responses(item.get("resps"))
-                        for item in data["logs"]
-                    }
+                    task_logs = {str(item["doc_id"]): _normalize_responses(item.get("resps")) for item in data["logs"]}
                     if task_logs:
                         result[task] = task_logs
                 except (KeyError, TypeError, json.JSONDecodeError):
@@ -243,7 +237,7 @@ class FromLog(lmms):
         pbar.close()
         return results
 
-    def loglikelihood(self, requests: List[Instance]) -> List[Tuple[float, bool]]:
+    def loglikelihood(self, requests: list[Instance]) -> list[tuple[float, bool]]:
         raise NotImplementedError("from_log only supports generative tasks")
 
     def generate_until_multi_round(self, requests: list[Instance]) -> list[GenerationResult]:

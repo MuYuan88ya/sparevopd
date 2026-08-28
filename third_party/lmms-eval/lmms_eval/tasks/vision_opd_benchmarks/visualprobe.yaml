@@ -1,0 +1,12 @@
+group: visualprobe
+task:
+  - visualprobe_easy
+  - visualprobe_medium
+  - visualprobe_hard
+aggregate_metric_list:
+  - metric: visualprobe_accuracy
+    aggregation: mean
+    weight_by_size: false
+metadata:
+  version: 1.0
+

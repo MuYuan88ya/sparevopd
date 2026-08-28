@@ -3,7 +3,6 @@ import os
 from pathlib import Path
 
 import pytest
-
 from lmms_eval.api.instance import Instance
 from lmms_eval.models.simple.from_log import FromLog, load_jsonl_responses
 

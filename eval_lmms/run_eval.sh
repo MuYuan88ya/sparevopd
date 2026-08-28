@@ -25,6 +25,10 @@ GEN_MAX_RETRIES="${GEN_MAX_RETRIES:-5}"
 JUDGE_API_KEY="${JUDGE_API_KEY:-EMPTY}"
 JUDGE_API_BASE="${JUDGE_API_BASE:-http://127.0.0.1:${JUDGE_PORT:-8000}/v1}"
 JUDGE_MODEL_ID="${JUDGE_MODEL_ID:-}"
+JUDGE_PARALLEL_WORKERS="${JUDGE_PARALLEL_WORKERS:-32}"
+JUDGE_MAX_RETRIES="${JUDGE_MAX_RETRIES:-3}"
+JUDGE_TIMEOUT="${JUDGE_TIMEOUT:-600}"
+JUDGE_MAX_TOKENS="${JUDGE_MAX_TOKENS:-2048}"
 REQUIRE_JUDGE="${REQUIRE_JUDGE:-false}"
 
 if [[ -z "${EXPERIMENT_NAME}" ]]; then
@@ -143,20 +147,101 @@ from pathlib import Path
 payload = {
     "schema_version": 1,
     "experiment_name": experiment_name,
+    "created_at": datetime.now(timezone.utc).isoformat(),
     "benchmarks": [item for item in benchmarks.split(",") if item],
     "lmms_tasks": [item for item in tasks.split(",") if item],
     "eval_data_root": os.path.abspath(data_root),
     "generation_dir": os.path.abspath(generation_dir),
     "evaluation_dir": os.path.abspath(evaluation_dir),
-    "generation_model_id": generation_model,
     "seed": seed,
     "limit": limit or None,
     "lmms_eval_commit": "84770436f0c3b099efbb56f75c6c0db79bb91739",
-    "generation_completed_at": datetime.now(timezone.utc).isoformat(),
+    "generation": {
+        "status": "complete",
+        "model_id": generation_model,
+        "completed_at": datetime.now(timezone.utc).isoformat(),
+    },
+    "evaluation": {"status": "pending"},
 }
 path = Path(manifest_path)
+if path.exists():
+    previous = json.loads(path.read_text(encoding="utf-8"))
+    payload["created_at"] = previous.get("created_at", payload["created_at"])
 temporary = path.with_suffix(path.suffix + ".tmp")
 temporary.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+temporary.replace(path)
+PY
+}
+
+validate_existing_manifest() {
+  if [[ ! -f "${MANIFEST_PATH}" ]]; then
+    return
+  fi
+  "${PYTHON_BIN}" - "${MANIFEST_PATH}" "${LMMS_TASKS}" "${EVAL_DATA_ROOT}" \
+    "${GEN_MODEL_ID}" "${SEED}" "${LIMIT}" <<'PY'
+import json
+import os
+import sys
+
+manifest_path, tasks, data_root, model_id, seed, limit = sys.argv[1:]
+with open(manifest_path, encoding="utf-8") as handle:
+    manifest = json.load(handle)
+generation = manifest.get("generation", {})
+expected = {
+    "lmms_tasks": (manifest.get("lmms_tasks", []), [item for item in tasks.split(",") if item]),
+    "eval_data_root": (
+        os.path.abspath(manifest.get("eval_data_root", data_root)),
+        os.path.abspath(data_root),
+    ),
+    "generation_model": (
+        generation.get("model_id", manifest.get("generation_model_id")),
+        model_id,
+    ),
+    "seed": (str(manifest.get("seed", "")), seed),
+    "limit": (str(manifest.get("limit") or ""), limit),
+}
+changed = {name: values for name, values in expected.items() if values[0] not in (None, "", []) and values[0] != values[1]}
+if changed:
+    raise SystemExit(
+        f"Existing experiment has incompatible generation settings: {changed}. "
+        "Use a new EXPERIMENT_NAME."
+    )
+PY
+}
+
+update_evaluation_manifest() {
+  local status="$1"
+  local judge_model="$2"
+  local error_message="${3:-}"
+  "${PYTHON_BIN}" - "${MANIFEST_PATH}" "${status}" "${judge_model}" "${error_message}" <<'PY'
+import json
+import sys
+from datetime import datetime, timezone
+from pathlib import Path
+
+path = Path(sys.argv[1])
+status, judge_model, error_message = sys.argv[2:]
+manifest = json.loads(path.read_text(encoding="utf-8"))
+previous_model = manifest.get("evaluation", {}).get("model_id")
+if previous_model and judge_model and previous_model != judge_model:
+    raise SystemExit(
+        f"Experiment was previously judged by {previous_model!r}, not {judge_model!r}. "
+        "Use a new EXPERIMENT_NAME to avoid mixing Judge results."
+    )
+evaluation = manifest.setdefault("evaluation", {})
+evaluation.update(
+    {
+        "status": status,
+        "model_id": judge_model or None,
+        "updated_at": datetime.now(timezone.utc).isoformat(),
+    }
+)
+if error_message:
+    evaluation["error"] = error_message
+else:
+    evaluation.pop("error", None)
+temporary = path.with_suffix(path.suffix + ".tmp")
+temporary.write_text(json.dumps(manifest, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
 temporary.replace(path)
 PY
 }
@@ -197,6 +282,7 @@ run_generation() {
   if [[ -z "${GEN_MODEL_ID}" ]]; then
     GEN_MODEL_ID="$(discover_model_id "${GEN_API_BASE}" "${GEN_API_KEY}")"
   fi
+  validate_existing_manifest
 
   echo "[generate] experiment=${EXPERIMENT_NAME}"
   echo "[generate] tasks=${LMMS_TASKS}"
@@ -252,7 +338,7 @@ run_evaluation() {
   export HF_HOME="${EVAL_DATA_ROOT}/huggingface"
   export HF_DATASETS_CACHE="${HF_HOME}/datasets"
   local needs_judge="${REQUIRE_JUDGE}"
-  if [[ ",${LMMS_TASKS}," == *,hrbench4k,* || ",${LMMS_TASKS}," == *,hrbench8k,* || ",${LMMS_TASKS}," == *,hrbench,* ]]; then
+  if [[ ",${LMMS_TASKS}," == *,hrbench4k,* || ",${LMMS_TASKS}," == *,hrbench8k,* || ",${LMMS_TASKS}," == *,hrbench,* || ",${LMMS_TASKS}," == *,zoombench,* || ",${LMMS_TASKS}," == *,visualprobe,* || ",${LMMS_TASKS}," == *,visualprobe_easy,* || ",${LMMS_TASKS}," == *,visualprobe_medium,* || ",${LMMS_TASKS}," == *,visualprobe_hard,* ]]; then
     needs_judge=true
   fi
 
@@ -264,8 +350,15 @@ run_evaluation() {
     export OPENAI_API_KEY="${JUDGE_API_KEY}"
     export OPENAI_API_URL="${JUDGE_API_BASE}/chat/completions"
     export MODEL_VERSION="${JUDGE_MODEL_ID}"
+    export VISION_OPD_JUDGE_API_BASE="${JUDGE_API_BASE}"
+    export VISION_OPD_JUDGE_API_KEY="${JUDGE_API_KEY}"
+    export VISION_OPD_JUDGE_MODEL_ID="${JUDGE_MODEL_ID}"
+    export VISION_OPD_JUDGE_CACHE_DIR="${RUN_DIR}/judge_cache"
+    export JUDGE_PARALLEL_WORKERS JUDGE_MAX_RETRIES JUDGE_TIMEOUT JUDGE_MAX_TOKENS
     echo "[evaluate] judge_endpoint=${JUDGE_API_BASE} judge_model=${JUDGE_MODEL_ID}"
   fi
+
+  update_evaluation_manifest running "${JUDGE_MODEL_ID}"
 
   echo "[evaluate] experiment=${EXPERIMENT_NAME}"
   echo "[evaluate] tasks=${LMMS_TASKS}"
@@ -286,7 +379,13 @@ run_evaluation() {
   if [[ -n "${LIMIT}" ]]; then
     command+=(--limit "${LIMIT}")
   fi
-  "${command[@]}"
+  if "${command[@]}"; then
+    update_evaluation_manifest complete "${JUDGE_MODEL_ID}"
+  else
+    local exit_code=$?
+    update_evaluation_manifest incomplete "${JUDGE_MODEL_ID}" "lmms-eval exited with status ${exit_code}"
+    return "${exit_code}"
+  fi
   echo "[evaluate] complete; results=${EVALUATION_DIR}"
 }
 

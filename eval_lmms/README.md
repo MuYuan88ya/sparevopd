@@ -92,8 +92,7 @@ bash eval_lmms/run_eval.sh
 第二阶段会从 manifest 恢复 task 列表和生成日志位置，不需要再次传 `BENCHMARKS`、
 `EVAL_DATA_ROOT` 或生成 API 参数。
 
-HRBench 的官方 lmms-eval task 在无法直接抽取选项时会调用 LLM Judge。先启动 Judge
-vLLM，再运行：
+HRBench、ZoomBench 和 VisualProbe 会调用 LLM Judge。先启动 Judge vLLM，再运行：
 
 ```bash
 EVAL_PHASE=evaluate \
@@ -103,7 +102,9 @@ JUDGE_API_KEY=EMPTY \
 bash eval_lmms/run_eval.sh
 ```
 
-`JUDGE_MODEL_ID` 同样支持 `/v1/models` 单模型自动发现。对于其他自定义、也会访问
+`JUDGE_MODEL_ID` 同样支持 `/v1/models` 单模型自动发现。ZoomBench 和 VisualProbe
+会并发提交 Judge 请求，并在实验目录保存逐样本 Judge cache；评估中断后重新执行时，
+答案未变化的成功结果会直接复用，只重试缺失或失败样本。对于其他自定义、也会访问
 Judge 的 lmms-eval task，请额外设置 `REQUIRE_JUDGE=true`。
 
 ## 单次顺序运行
@@ -140,6 +141,10 @@ bash eval_lmms/run_eval.sh
 | `JUDGE_PORT` | `8000` | 本机 Judge 端口简写 |
 | `JUDGE_API_KEY` | `EMPTY` | Judge API key |
 | `JUDGE_MODEL_ID` | 自动发现 | Judge 模型 ID |
+| `JUDGE_PARALLEL_WORKERS` | `32` | ZoomBench/VisualProbe Judge 并发数 |
+| `JUDGE_MAX_RETRIES` | `3` | 单个 Judge 请求最大尝试次数 |
+| `JUDGE_TIMEOUT` | `600` | Judge 请求超时秒数 |
+| `JUDGE_MAX_TOKENS` | `2048` | Judge 最大输出 Token 数 |
 | `PYTHON_BIN` | `python3` | lmms-eval 运行环境解释器 |
 | `LIMIT` | 无 | 调试时限制每个 task 的样本数 |
 | `SEED` | `0` | lmms-eval 随机种子 |
@@ -154,13 +159,69 @@ bash eval_lmms/run_eval.sh
 | `mme-realworld-cn` | `mmerealworld_cn` |
 | `mme-realworld-lite` | `mmerealworld_lite` |
 | `cv-bench` | `cv_bench` |
+| `zoombench` | `zoombench`（Vision-OPD 新增） |
+| `visualprobe` | `visualprobe` group（Vision-OPD 新增） |
 
 `mmstar`、`pope`、`pope_adv`、`pope_pop`、`pope_random` 和 `mmvp` 可直接使用；
 也可以在 `BENCHMARKS` 中直接传任意 vendored lmms-eval task 名。
 
-固定的上游版本目前没有原生 `zoombench` 和 `visualprobe` task，因此新入口暂不把这两个
-名称静默映射到别的 benchmark；继续使用它们时请走未修改的旧 `eval/`。这样可以避免
-新旧评估定义不一致却产出看似可比较的分数。
+新增 benchmark 保持旧 `eval/` 的定义：
+
+- `zoombench` 使用 `inclusionAI/ZoomBench` 的完整 `image`，不使用 `crop_image`；问题和
+  标准答案分别来自 `query`、`response`。
+- `visualprobe` 是 `visualprobe_easy`、`visualprobe_medium`、`visualprobe_hard` 三个
+  子任务组成的 group。每档分别统计准确率，最终分数为三档准确率的等权平均，而不是
+  按样本数加权。
+- 两者先执行规范化精确匹配和可选 MathRuler；无法规则确认的答案使用与旧脚本相同的
+  Yes/No 语义一致性 Judge prompt。
+- Judge 输出采用与 HRBench 选项解析相同的原则：`Yes.`、`(NO)`、`The answer is yes` 和
+  `<answer>No</answer>` 等格式可以解析；同时出现 Yes/No 或没有明确结论时会重试，
+  不会直接记为错误答案。
+- Judge API 最终失败会使评估返回非零，不会被静默记成错误答案；已成功项保存在
+  `judge_cache/`，可以续跑。缓存同时校验问题、标准答案、模型回答、Judge 模型和解析
+  协议版本；旧解析协议产生的缓存会自动忽略。
+
+## 实验目录与结果查看
+
+不额外维护实验管理脚本。每个 `EXPERIMENT_NAME` 本身就是一个实验目录，例如：
+
+```text
+eval_lmms/results/
+├── baseline/
+├── sparse-teacher-step100/
+└── sparse-teacher-step200/
+```
+
+建议直接用 checkpoint 或训练实验名作为 `EXPERIMENT_NAME`。同名实验重新生成时，task、
+数据根目录、生成模型、seed 和 limit 必须与已有 `manifest.json` 一致；配置或 checkpoint
+发生变化时使用新的实验名，避免覆盖和混合结果。manifest 只负责 generate/evaluate 两个
+阶段之间的参数交接，不作为另一套实验数据库。
+
+vendored `lmms-eval` 已自带 Web UI 和 Log Viewer。启动方式：
+
+```bash
+cd third_party/lmms-eval
+uv run --extra tui lmms-eval-ui
+```
+
+浏览器打开后进入 **Log Viewer**，将 **Logs Path** 设置为结果根目录的绝对路径，例如：
+
+```text
+/path/to/Vision-OPD/eval_lmms/results
+```
+
+然后点击 **Scan**。Log Viewer 会递归查找所有实验中的 `*_results.json`，可直接查看：
+
+- 实验/模型名、评估时间和 task 列表；
+- 每个 benchmark 的聚合指标与运行配置；
+- 使用 `--log_samples` 保存的逐样本回答、评分字段和分页记录。
+
+当前两阶段流程的最终评估记录以 `EXPERIMENT_NAME` 作为原生 lmms-eval 的 model name，
+因此在 Log Viewer 中可以直接按实验名识别。`generation/` 下的 predict-only 记录是阶段一
+的原始生成日志，最终指标应查看 `evaluation/` 下、model name 等于实验名的记录。
+
+如果需要云端实验追踪，lmms-eval 也原生支持 `--wandb_args` 和 `--wandb_log_samples`；
+当前封装默认使用无需账号的本地 Log Viewer。
 
 ## 输出结构
 
@@ -171,6 +232,8 @@ eval_lmms/results/<EXPERIMENT_NAME>/
 │   └── <generation-model>/
 │       ├── *_results.json
 │       └── *_samples_<task>.jsonl
+├── judge_cache/
+│   └── <task>.json
 └── evaluation/
     └── <EXPERIMENT_NAME>/
         ├── *_results.json

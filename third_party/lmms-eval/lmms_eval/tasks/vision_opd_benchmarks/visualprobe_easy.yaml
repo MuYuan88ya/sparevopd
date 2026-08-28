@@ -1,0 +1,23 @@
+dataset_path: Mini-o3/VisualProbe_Easy
+dataset_kwargs:
+  token: true
+task: visualprobe_easy
+test_split: validation
+output_type: generate_until
+doc_to_visual: !function utils.visualprobe_doc_to_visual
+doc_to_text: !function utils.visualprobe_doc_to_text
+doc_to_target: !function utils.visualprobe_doc_to_target
+generation_kwargs:
+  max_new_tokens: 32768
+  temperature: 0
+  top_p: 1.0
+  do_sample: false
+process_results: !function utils.visualprobe_process_results
+metric_list:
+  - metric: visualprobe_accuracy
+    aggregation: !function utils.judged_accuracy
+    higher_is_better: true
+metadata:
+  version: 1.0
+  category: Easy
+

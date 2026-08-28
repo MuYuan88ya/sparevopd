@@ -40,47 +40,62 @@ PROMPT_TEMPLATE = (
 )
 
 
-def extract_first_option(text):
-    if not text:
+def _extract_unique_option(text, valid_options="ABCDEFGH"):
+    if not isinstance(text, str) or not text.strip():
         return ""
-    match = re.search(r"\(([A-Z])\)", text)
-    if match:
-        return match.group(1)
-    match = re.search(r"([A-Z])[\.\)\s]", text)
-    if match:
-        return match.group(1)
-    match = re.search(r"([A-Z])", text)
-    return match.group(1) if match else ""
+
+    value = text.strip()
+    valid = re.escape(valid_options.upper())
+    explicit_patterns = (
+        rf"(?:final\s+answer|correct\s+answer|answer|option|choice)\s*"
+        rf"(?:is|:|：|=)?\s*[\(\[]?([{valid}])[\)\]]?\b",
+        rf"(?:最终答案|答案|选项)\s*(?:是|为|:|：)?\s*[\(\[]?([{valid}])[\)\]]?",
+    )
+    explicit_matches = []
+    for pattern in explicit_patterns:
+        explicit_matches.extend(re.finditer(pattern, value, flags=re.IGNORECASE))
+    if explicit_matches:
+        match = max(explicit_matches, key=lambda candidate: candidate.start())
+        ambiguous_suffix = rf"\s*[\)\]]?\s*(?:or|/|或|和)\s*[\(\[]?[{valid}]\b"
+        if re.match(ambiguous_suffix, value[match.end() :], flags=re.IGNORECASE):
+            return ""
+        return match.group(1).upper()
+
+    candidates = {
+        match.group(1).upper()
+        for match in re.finditer(
+            rf"(?<![A-Za-z0-9])([{valid}])(?![A-Za-z0-9])",
+            value,
+            flags=re.IGNORECASE,
+        )
+    }
+    return next(iter(candidates)) if len(candidates) == 1 else ""
+
+
+def extract_first_option(text):
+    return _extract_unique_option(text)
 
 
 def extract_mcq_option(answer):
-    if not isinstance(answer, str) or not answer:
+    return _extract_unique_option(answer)
+
+
+def _extract_unique_yes_no(text):
+    if not isinstance(text, str) or not text:
         return ""
-    match = re.match(r"^[ (\[]*([A-F])(?:(?=$)|[\.\)\]]|(?:[\:\-]\s+))", answer.strip())
-    return match.group(1) if match else ""
+    if re.search(r"\b(?:not|neither)\s+(?:yes|no)\b", text, re.IGNORECASE):
+        return ""
+    decisions = {match.group(0).lower() for match in re.finditer(r"\b(?:yes|no)\b", text, re.IGNORECASE)}
+    return next(iter(decisions)) if len(decisions) == 1 else ""
 
 
 def pope_extract(text):
-    if not isinstance(text, str) or not text:
-        return ""
-    value = text.lstrip("*").strip()
-    if value.lower().startswith("answer"):
-        value = value.split("answer", 1)[1].lstrip(":").lstrip("*").strip()
-    if value.lower().startswith("yes"):
-        return "yes"
-    if value.lower().startswith("no"):
-        return "no"
-    last = value.rstrip(".").rstrip("*").strip().split()[-1] if value.strip() else ""
-    last = last.lstrip("*").rstrip("*").lower()
-    return last if last in {"yes", "no"} else text.strip()
+    return _extract_unique_yes_no(text)
 
 
 def mmvp_extract(text):
-    if not isinstance(text, str) or not text:
-        return ""
-    value = text.strip().lower()
-    match = re.search(r"\(([ab])\)", value) or re.search(r"\b([ab])\b", value)
-    return f"({match.group(1)})" if match else ""
+    option = _extract_unique_option(text, valid_options="AB")
+    return f"({option.lower()})" if option else ""
 
 
 def first_letter_match(gt, answer):
@@ -92,14 +107,35 @@ def first_letter_match(gt, answer):
 def extract_answer(model_answer_raw):
     if not isinstance(model_answer_raw, str):
         return ""
-    if "<answer>" in model_answer_raw:
-        start = model_answer_raw.find("<answer>")
-        end = model_answer_raw.find("</answer>", start + len("<answer>"))
-        if start != -1 and end != -1:
-            return model_answer_raw[start + len("<answer>") : end].strip()
-    if "Answer:" in model_answer_raw:
-        return model_answer_raw[model_answer_raw.find("Answer:") :].strip()
-    return model_answer_raw.strip()
+    answer = model_answer_raw.strip()
+    think_end = answer.lower().rfind("</think>")
+    if think_end != -1:
+        answer = answer[think_end + len("</think>") :].strip()
+
+    tagged_answers = re.findall(r"<answer>\s*(.*?)\s*</answer>", answer, flags=re.IGNORECASE | re.DOTALL)
+    if tagged_answers:
+        return tagged_answers[-1].strip()
+
+    final_markers = list(
+        re.finditer(
+            r"(?:\b(?:the\s+)?final\s+answer|\banswer|最终答案|答案)\s*(?:is|为|是)?\s*[:：]\s*",
+            answer,
+            flags=re.IGNORECASE,
+        )
+    )
+    if final_markers:
+        return answer[final_markers[-1].end() :].strip()
+    return answer
+
+
+def parse_judge_decision(raw_output):
+    answer = extract_answer(raw_output)
+    decision = _extract_unique_yes_no(answer)
+    if decision == "yes":
+        return "Yes"
+    if decision == "no":
+        return "No"
+    return ""
 
 
 def judge_via_api(
@@ -137,7 +173,10 @@ def judge_via_api(
                 text = (response.choices[0].message.content or "").strip()
                 if not text:
                     raise ValueError("Judge API returned an empty response")
-                return index, text, None
+                decision = parse_judge_decision(text)
+                if not decision:
+                    raise ValueError(f"Judge API returned an ambiguous Yes/No response: {text!r}")
+                return index, decision, None
             except Exception as exc:  # the exception text is persisted for resumability
                 last_error = str(exc)
                 if attempt < max_retries:
@@ -175,15 +214,26 @@ def apply_rule_grading(item, benchmark, grade_answer):
     gt = str(item.get("response", ""))
     item["extracted_answer"] = extracted_answer
 
-    if benchmark in POPE_BENCHMARKS and pope_extract(extracted_answer) == gt.strip().lower():
-        item["judge"] = "Yes"
-        item["judge_source"] = "pope_exact"
-        return None
+    if benchmark in POPE_BENCHMARKS:
+        prediction = pope_extract(extracted_answer)
+        target = pope_extract(gt)
+        if prediction and target:
+            item["judge"] = "Yes" if prediction == target else "No"
+            item["judge_source"] = "pope_exact"
+            return None
     if benchmark in MMVP_BENCHMARKS:
         prediction = mmvp_extract(extracted_answer)
-        if prediction and prediction == gt.strip().lower():
-            item["judge"] = "Yes"
+        target = mmvp_extract(gt)
+        if prediction and target:
+            item["judge"] = "Yes" if prediction == target else "No"
             item["judge_source"] = "mmvp_option"
+            return None
+    if benchmark in MCQ_BENCHMARKS:
+        prediction = extract_first_option(extracted_answer)
+        target = extract_mcq_option(gt)
+        if prediction and target:
+            item["judge"] = "Yes" if prediction == target else "No"
+            item["judge_source"] = "first letter"
             return None
     if grade_answer is not None:
         try:
@@ -193,10 +243,6 @@ def apply_rule_grading(item, benchmark, grade_answer):
                 return None
         except Exception:
             pass
-    if benchmark in MCQ_BENCHMARKS and first_letter_match(gt, extracted_answer):
-        item["judge"] = "Yes"
-        item["judge_source"] = "first letter"
-        return None
     return PROMPT_TEMPLATE.format(gt=gt, response=extracted_answer, question=question)
 
 
@@ -267,9 +313,10 @@ def main():
             seen.add(uid)
             item["sample_uid"] = uid
             previous = existing.get(uid)
+            previous_judge = parse_judge_decision(previous.get("judge", "")) if previous else ""
             can_reuse = (
                 previous
-                and previous.get("judge")
+                and previous_judge
                 and not previous.get("judge_error")
                 and previous.get("model_answer") == item.get("model_answer")
             )
@@ -277,6 +324,7 @@ def main():
                 for key in ("extracted_answer", "judge", "judge_source"):
                     if key in previous:
                         item[key] = previous[key]
+                item["judge"] = previous_judge
                 continue
             if is_generation_error(item):
                 if not args.allow_partial:
