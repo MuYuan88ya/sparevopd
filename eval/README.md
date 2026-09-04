@@ -12,6 +12,7 @@ EXPERIMENT_NAME=sparse-teacher-step100 \
 EVAL_DATA_ROOT=/data/vision_eval \
 BENCHMARKS=vstar,zoombench,mmstar \
 GEN_PORT=8000 \
+GEN_TEMPERATURE=0.1 \
 bash eval/run_eval.sh
 ```
 
@@ -92,10 +93,14 @@ JUDGE_MODEL_ID=judge-model
 | `PARALLEL_WORKERS` | `256` | 生成请求并发数 |
 | `JUDGE_PARALLEL_WORKERS` | `32` | Judge 请求并发数 |
 | `MAX_TOKENS` | `32768` | 生成最大 Token 数 |
+| `GEN_TEMPERATURE` | `0` | 待评估模型的生成温度；遇到低温重复循环时建议从 `0.1` 开始 |
 | `JUDGE_MAX_TOKENS` | `2048` | Judge 最大 Token 数 |
 | `ENABLE_THINKING` | 未设置 | 可设为 `True` 或 `False` |
 
 `all` 会先完成全部生成，再执行统一 Judge，但不会替用户切换外部模型服务。同一组 GPU 复用时，应分别运行 `generate` 和 `evaluate`。
+
+`GEN_TEMPERATURE` 只控制待评估模型生成答案。LLM Judge 仍固定使用温度 `0`，避免评判结果随机漂移。
+温度会记录在实验 manifest 中；修改温度时必须使用新的 `EXPERIMENT_NAME`，避免续跑文件混合不同采样配置。
 
 ## 续跑与完整性检查
 

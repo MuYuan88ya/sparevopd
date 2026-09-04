@@ -54,6 +54,7 @@ def test_local_defaults_require_no_api_keys_or_output_root():
     args = eval_pipeline.build_parser().parse_args(["--experiment-name", "local-run"])
     assert args.gen_api_key == "EMPTY"
     assert args.judge_api_key == "EMPTY"
+    assert args.temperature == 0.0
     assert Path(args.output_root) == EVAL_DIR / "results"
 
 
@@ -108,6 +109,7 @@ def test_generate_prepares_every_dataset_before_inference(tmp_path, monkeypatch)
         gen_api_key="key",
         gen_model_id=None,
         max_tokens=64,
+        temperature=0.2,
         max_retries=2,
         parallel_workers=4,
         enable_thinking=None,
@@ -119,6 +121,9 @@ def test_generate_prepares_every_dataset_before_inference(tmp_path, monkeypatch)
     manifest = json.loads((tmp_path / "output" / "experiment" / "manifest.json").read_text())
     assert manifest["generation"]["status"] == "complete"
     assert manifest["generation"]["model_id"] == "served-model"
+    assert manifest["generation"]["temperature"] == 0.2
+    inference_commands = [command for command in commands if Path(command[1]).name == "infer.py"]
+    assert all(command[command.index("--temperature") + 1] == "0.2" for command in inference_commands)
 
 
 def test_unified_judge_reuses_existing_results_and_scatters_outputs(tmp_path, monkeypatch):

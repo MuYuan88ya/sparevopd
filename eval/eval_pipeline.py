@@ -92,6 +92,8 @@ def initialize_manifest(args, benchmarks: list[str], model_id: str) -> tuple[Pat
             "seed": (manifest.get("seed"), args.seed),
             "model_id": (previous_generation.get("model_id"), model_id),
             "max_tokens": (previous_generation.get("max_tokens"), args.max_tokens),
+            # Temperature was hard-coded to zero before it was recorded in manifests.
+            "temperature": (previous_generation.get("temperature", 0.0), args.temperature),
             "enable_thinking": (previous_generation.get("enable_thinking"), args.enable_thinking),
         }
         changed = {
@@ -126,6 +128,7 @@ def initialize_manifest(args, benchmarks: list[str], model_id: str) -> tuple[Pat
         "api_base": args.gen_api_base,
         "model_id": model_id,
         "max_tokens": args.max_tokens,
+        "temperature": args.temperature,
         "max_retries": args.max_retries,
         "parallel_workers": args.parallel_workers,
         "enable_thinking": args.enable_thinking,
@@ -186,6 +189,8 @@ def run_generate(args) -> Path:
             model_id,
             "--max_tokens",
             str(args.max_tokens),
+            "--temperature",
+            str(args.temperature),
             "--max_retries",
             str(args.max_retries),
             "--parallel_workers",
@@ -346,6 +351,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--benchmarks")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--max-tokens", type=int, default=32768)
+    parser.add_argument("--temperature", type=float, default=0.0)
     parser.add_argument("--max-retries", type=int, default=3)
     parser.add_argument("--parallel-workers", type=int, default=256)
     parser.add_argument("--enable-thinking", choices=["True", "False"])
@@ -367,6 +373,8 @@ def main() -> None:
     args = build_parser().parse_args()
     if Path(args.experiment_name).name != args.experiment_name or args.experiment_name in {".", ".."}:
         raise ValueError("EXPERIMENT_NAME must be a single directory name, not a path.")
+    if not 0.0 <= args.temperature <= 2.0:
+        raise ValueError("GEN_TEMPERATURE/--temperature must be between 0 and 2.")
     args.gen_api_base = normalize_api_base(args.gen_api_base, None)
     args.judge_api_base = normalize_api_base(args.judge_api_base, None)
     if args.phase in {"generate", "all"}:

@@ -125,11 +125,14 @@ def main():
     parser.add_argument("--api_key", default="EMPTY", type=str)
     parser.add_argument("--model_id", required=True, type=str, help="OpenAI model ID")
     parser.add_argument("--max_tokens", default=4096, type=int)
+    parser.add_argument("--temperature", default=0.0, type=float)
     parser.add_argument("--max_retries", default=3, type=int)
     parser.add_argument("--parallel_workers", default=32, type=int)
     parser.add_argument("--enable_thinking", type=str, default=None, choices=["True", "False"],
                         help="Set enable_thinking via chat_template_kwargs (True=on, False=off)")
     args = parser.parse_args()
+    if not 0.0 <= args.temperature <= 2.0:
+        parser.error("--temperature must be between 0 and 2")
 
     benchmark = args.benchmark
     data_path = Path(args.benchmark_json)
@@ -212,7 +215,8 @@ def main():
                     model=args.model_id,
                     messages=messages,
                     max_tokens=args.max_tokens,
-                    temperature=0,
+                    temperature=args.temperature,
+                    seed=args.seed,
                     **extra_kwargs,
                 )
                 raw_model_answer = (resp.choices[0].message.content or "").strip()

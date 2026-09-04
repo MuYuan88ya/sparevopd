@@ -106,6 +106,7 @@ ARGS=(
   --output-root "${OUTPUT_ROOT}"
   --seed "${SEED:-42}"
   --max-tokens "${MAX_TOKENS:-32768}"
+  --temperature "${GEN_TEMPERATURE:-${TEMPERATURE:-0}}"
   --max-retries "${MAX_RETRIES:-3}"
   --parallel-workers "${PARALLEL_WORKERS:-256}"
   --gen-api-key "${GEN_API_KEY}"
