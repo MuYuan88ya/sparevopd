@@ -129,3 +129,7 @@ datagen:
 
 # Additional kwargs when calling tokenizer.apply_chat_template
 apply_chat_template_kwargs: {}
+
+# Optional UTF-8 file whose content is injected as the first system message.
+# If the dataset already starts with a system message, this value replaces it.
+system_prompt_file: null

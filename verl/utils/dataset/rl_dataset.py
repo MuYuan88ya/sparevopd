@@ -113,6 +113,7 @@ class RLHFDataset(Dataset):
         self.truncation = config.get("truncation", "error")
         self.filter_overlong_prompts = config.get("filter_overlong_prompts", True)
         self.apply_chat_template_kwargs = config.get("apply_chat_template_kwargs", {})
+        self.system_prompt = self._load_system_prompt(config.get("system_prompt_file", None))
 
         self.tool_config_path = config.get("tool_config_path", None)
         self.tool_schemas = None
@@ -142,6 +143,21 @@ class RLHFDataset(Dataset):
 
         self._download()
         self._read_files_and_tokenize()
+
+    @staticmethod
+    def _load_system_prompt(system_prompt_file: Optional[str]) -> Optional[str]:
+        if not system_prompt_file:
+            return None
+
+        prompt_path = os.path.abspath(os.path.expanduser(system_prompt_file))
+        if not os.path.isfile(prompt_path):
+            raise FileNotFoundError(f"System prompt file not found: {prompt_path}")
+
+        with open(prompt_path, encoding="utf-8") as prompt_file:
+            system_prompt = prompt_file.read().strip()
+        if not system_prompt:
+            raise ValueError(f"System prompt file is empty: {prompt_path}")
+        return system_prompt
 
     def _download(self, use_origin_parquet=False):
         from verl.utils.fs import copy_to_local
@@ -295,7 +311,13 @@ class RLHFDataset(Dataset):
         Returns:
             messages: List of messages with replaced placeholder.
         """
-        messages: list = example[self.prompt_key]
+        messages: list = copy.deepcopy(example[self.prompt_key])
+        if self.system_prompt:
+            system_message = {"role": "system", "content": self.system_prompt}
+            if messages and messages[0].get("role") == "system":
+                messages[0] = system_message
+            else:
+                messages.insert(0, system_message)
         # When concatenating image and video datasets, pop will return None for image or video sample
         images = example.pop(self.image_key, None) or []
         videos = example.pop(self.video_key, None) or []

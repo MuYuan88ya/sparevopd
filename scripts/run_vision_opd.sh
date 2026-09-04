@@ -79,6 +79,7 @@ TRAINER_LOGGER='["console","tensorboard"]'
 ROLLOUT_AGENT_NUM_WORKERS=8
 DATA_DATALOADER_NUM_WORKERS=8
 CUSTOM_CHAT_TEMPLATE_FILE="${PROJECT_ROOT}/chat_templates/perception_chat_template_qwen35.jinja"
+SHARED_SYSTEM_PROMPT_FILE="${SHARED_SYSTEM_PROMPT_FILE-${PROJECT_ROOT}/prompts/imagine_shared.txt}"
 
 # --- Data Paths ---
 DATA_DIR="${PROJECT_ROOT}/data"
@@ -112,11 +113,21 @@ if [[ -n "${CUSTOM_CHAT_TEMPLATE_FILE}" ]]; then
     CHAT_TEMPLATE_ARGS+=(actor_rollout_ref.model.custom_chat_template_file="$CUSTOM_CHAT_TEMPLATE_FILE")
 fi
 
+SYSTEM_PROMPT_ARGS=()
+if [[ -n "${SHARED_SYSTEM_PROMPT_FILE}" ]]; then
+    if [[ ! -f "${SHARED_SYSTEM_PROMPT_FILE}" ]]; then
+        echo "Shared system prompt file not found: ${SHARED_SYSTEM_PROMPT_FILE}" >&2
+        exit 1
+    fi
+    SYSTEM_PROMPT_ARGS+=(data.system_prompt_file="$SHARED_SYSTEM_PROMPT_FILE")
+fi
+
 echo "Running: $EXPERIMENT_NAME"
 echo "Teacher model source: $TEACHER_MODEL_SOURCE"
 echo "Teacher regularization: $TEACHER_REGULARIZATION"
 echo "Teacher update rate: $TEACHER_UPDATE_RATE"
 echo "Teacher visual token mode: $TEACHER_VISUAL_TOKEN_MODE"
+echo "Shared system prompt: ${SHARED_SYSTEM_PROMPT_FILE:-disabled}"
 echo "Distillation token weight mode: $DISTILLATION_TOKEN_WEIGHT_MODE"
 if [[ "$DISTILLATION_TOKEN_WEIGHT_MODE" == "contrastive" ]]; then
     echo "Contrastive negative mode: $CONTRASTIVE_NEGATIVE_MODE"
@@ -214,4 +225,5 @@ python3 -m verl.trainer.main_ppo --config-name "$CONFIG_NAME" \
     trainer.default_local_dir=$TRAINER_DEFAULT_LOCAL_DIR \
     trainer.rollout_data_dir="$TRAINER_ROLLOUT_DATA_DIR" \
     "${CHAT_TEMPLATE_ARGS[@]}" \
+    "${SYSTEM_PROMPT_ARGS[@]}" \
     "${EXTRA_ARGS[@]}"

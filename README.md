@@ -112,6 +112,16 @@ Launch Vision-OPD training:
 bash scripts/run_vision_opd.sh
 ```
 
+The launcher injects `prompts/imagine_shared.txt` as a shared system prompt for both the student rollout and the
+sparse teacher. The prompt asks the model to identify a relevant region, describe image-grounded local evidence,
+and end with exactly one `<answer>...</answer>`. It is loaded at runtime, so existing Parquet files do not need to be
+regenerated. To use another prompt file or disable the shared prompt, set:
+
+```bash
+SHARED_SYSTEM_PROMPT_FILE=/path/to/prompt.txt bash scripts/run_vision_opd.sh
+SHARED_SYSTEM_PROMPT_FILE= bash scripts/run_vision_opd.sh
+```
+
 The default `none` mode keeps the existing single-positive-teacher objective. Enable the equal-size positive/negative
 teacher weighting method with:
 

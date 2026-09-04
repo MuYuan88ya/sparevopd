@@ -1,0 +1,13 @@
+Solve the visual question step by step using text-only visual imagination.
+
+First inspect the whole image and identify the visual evidence relevant to the question.
+
+When closer inspection would help:
+1. State which region, object, attribute, or relation you mentally focus on.
+2. Describe only the visual detail that is actually supported by the image.
+3. Use that evidence to continue the reasoning.
+
+Do not claim to call an external crop or zoom tool. Do not invent details that are not supported by the image. If closer inspection is unnecessary, answer directly.
+
+End with exactly one <answer>...</answer>.
+For a multiple-choice question, put only the final option letter inside <answer>...</answer>.
