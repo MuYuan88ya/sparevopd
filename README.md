@@ -4,17 +4,14 @@
 
 <p align="center">
   <a href="https://github.com/MuYuan88ya/sparevopd">Code</a> |
-  <a href="https://github.com/VisionOPD/Vision-OPD">Original Vision-OPD Repository</a> |
-  <a href="https://arxiv.org/abs/2605.18740">Vision-OPD Paper</a> |
   <a href="https://huggingface.co/datasets/yuanqianhao/Vision-OPD-6K">Training Data</a>
 </p>
 
 ## Overview
 
-SparseVOPD is an extension of
-[Vision-OPD](https://github.com/VisionOPD/Vision-OPD) for fine-grained visual
-reasoning with on-policy self-distillation. It replaces the crop-only teacher
-condition with a **same-image sparse visual-token teacher**:
+SparseVOPD is an on-policy self-distillation framework for fine-grained visual
+reasoning. It uses a **same-image sparse visual-token teacher** to provide
+dense token-level supervision for a full-image student:
 
 - The **student** receives the complete image and all visual tokens.
 - The **positive teacher** receives the same image, text prompt, and student
@@ -31,13 +28,6 @@ condition with a **same-image sparse visual-token teacher**:
 The method preserves the on-policy training principle: the student first
 generates a response, and the teacher evaluates that same response token by
 token under a stronger visual condition. No external teacher model is required.
-
-> **Relationship to Vision-OPD.** This repository is built on the official
-> [Vision-OPD codebase](https://github.com/VisionOPD/Vision-OPD) and retains its
-> training data, on-policy distillation objective, and evaluation targets. The
-> sparse same-image teacher, token-selection session, contrastive and
-> entropy-based weighting, visual-imagination prompt, and staged evaluation
-> workflow are extensions implemented in this repository.
 
 ## Method
 
@@ -96,7 +86,7 @@ The current 4B experiment improves the six-benchmark average from **77.07** to
 **77.92**. The six-benchmark suite consists of V* Bench, ZoomBench, HR-Bench 4K,
 HR-Bench 8K, MME-RealWorld-EN, and MME-RealWorld-CN.
 
-| Evaluation | Vision-OPD 4B | SparseVOPD 4B | Improvement |
+| Evaluation | 4B Baseline | SparseVOPD 4B | Improvement |
 |---|---:|---:|---:|
 | Six-benchmark average | 77.07 | **77.92** | **+0.85** |
 | V* Bench | 92.15 | **93.19** | **+1.04** |
@@ -111,8 +101,8 @@ to the aggregate over all six evaluations.
 ## Installation
 
 ```bash
-conda create -n vision-opd python=3.12 -y
-conda activate vision-opd
+conda create -n sparsevopd python=3.12 -y
+conda activate sparsevopd
 pip install --upgrade pip
 pip install --no-deps -r requirements.txt
 pip install -e . --no-deps
@@ -125,8 +115,7 @@ pip install causal-conv1d==1.6.1 --no-build-isolation
 ### Prepare the data
 
 Download and convert the
-[Vision-OPD-6K](https://huggingface.co/datasets/yuanqianhao/Vision-OPD-6K)
-training set:
+[training dataset](https://huggingface.co/datasets/yuanqianhao/Vision-OPD-6K):
 
 ```bash
 python scripts/prepare_data.py --data-dir ./data
@@ -179,7 +168,7 @@ can be adjusted at the top of [`scripts/run_vision_opd.sh`](scripts/run_vision_o
 
 ```bash
 bash scripts/merge_checkpoint.sh \
-  ./checkpoints/Vision-OPD-Qwen3.5-4B/global_step_65/
+  /path/to/checkpoint/global_step_65/
 ```
 
 The merge script exports the FSDP actor checkpoint as a standard Hugging Face
@@ -241,23 +230,23 @@ vllm serve /path/to/merged-checkpoint \
   --trust-remote-code
 ```
 
-## Acknowledgements and Citation
+## Citation and Acknowledgements
 
-SparseVOPD is derived from the official
-[Vision-OPD](https://github.com/VisionOPD/Vision-OPD) implementation. We thank
-the Vision-OPD authors and the open-source `verl` and `lmms-eval` communities.
-
-If this repository is useful in your work, please cite the original Vision-OPD
-paper:
+If this repository is useful in your work, please cite SparseVOPD:
 
 ```bibtex
-@article{yuan2026vision,
-  title={Vision-OPD: Learning to See Fine Details for Multimodal LLMs via On-Policy Self-Distillation},
-  author={Yuan, Qianhao and Lou, Jie and Yu, Xing and Lin, Hongyu and Sun, Le and Han, Xianpei and Lu, Yaojie},
-  journal={arXiv preprint arXiv:2605.18740},
-  year={2026}
+@misc{sparsevopd2026,
+  title        = {SparseVOPD: Same-Image Sparse Visual-Token Teachers for On-Policy Self-Distillation},
+  author       = {{SparseVOPD Contributors}},
+  year         = {2026},
+  howpublished = {GitHub repository},
+  url          = {https://github.com/MuYuan88ya/sparevopd}
 }
 ```
+
+This implementation is built on
+[`verl`](https://github.com/volcengine/verl) and adapted from
+[Vision-OPD](https://github.com/VisionOPD/Vision-OPD).
 
 ## License
 
