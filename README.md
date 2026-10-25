@@ -1,23 +1,114 @@
-# Vision-OPD
+# SparseVOPD
 
-**Vision-OPD: Learning to See Fine-Grained Details for Multimodal LLMs via On-Policy Self-Distillation**
+**Same-Image Sparse Visual-Token Teachers for On-Policy Self-Distillation**
 
 <p align="center">
-📃 <a href="https://arxiv.org/pdf/2605.18740" target="_blank">Paper</a> | 
-🤗 <a href="https://huggingface.co/collections/yuanqianhao/vision-opd">Hugging Face</a> 
+  <a href="https://github.com/MuYuan88ya/sparevopd">Code</a> |
+  <a href="https://github.com/VisionOPD/Vision-OPD">Original Vision-OPD Repository</a> |
+  <a href="https://arxiv.org/abs/2605.18740">Vision-OPD Paper</a> |
+  <a href="https://huggingface.co/datasets/yuanqianhao/Vision-OPD-6K">Training Data</a>
 </p>
 
 ## Overview
 
-Vision-OPD is a regional-to-global on-policy self-distillation framework that transfers a model's own privileged regional perception to its full-image policy, enabling fine-grained visual understanding in a single forward pass — without external teachers, ground-truth labels, reward verifiers, or inference-time tool use.
+SparseVOPD is an extension of
+[Vision-OPD](https://github.com/VisionOPD/Vision-OPD) for fine-grained visual
+reasoning with on-policy self-distillation. It replaces the crop-only teacher
+condition with a **same-image sparse visual-token teacher**:
 
-<p align="center">
-  <img src="figures/average_bar_chart.png" alt="Vision-OPD Average Scores" width="60%"/>
-</p>
+- The **student** receives the complete image and all visual tokens.
+- The **positive teacher** receives the same image, text prompt, and student
+  response, but its language model retains all visual tokens covered by the
+  annotated bounding box and only a configurable, spatially distributed subset
+  of background tokens.
+- Optional token-reweighting strategies use either a paired negative teacher or
+  the positive teacher's predictive entropy to concentrate distillation on more
+  reliable response tokens.
+- A shared visual-imagination prompt encourages both student and teacher to
+  identify the relevant region, describe grounded local evidence, and reason
+  without invoking image-manipulation tools at inference time.
 
-<p align="center"><i>Average scores across fine-grained visual understanding benchmarks, including V* Bench, ZoomBench,  HR-Bench 4K, HR-Bench 8K, MME-RealWorld-EN and MME-RealWorld-CN.</i></p>
+The method preserves the on-policy training principle: the student first
+generates a response, and the teacher evaluates that same response token by
+token under a stronger visual condition. No external teacher model is required.
 
-## Environment Setup
+> **Relationship to Vision-OPD.** This repository is built on the official
+> [Vision-OPD codebase](https://github.com/VisionOPD/Vision-OPD) and retains its
+> training data, on-policy distillation objective, and evaluation targets. The
+> sparse same-image teacher, token-selection session, contrastive and
+> entropy-based weighting, visual-imagination prompt, and staged evaluation
+> workflow are extensions implemented in this repository.
+
+## Method
+
+### Same-image sparse positive teacher
+
+For each image, the bounding box is mapped to the merged visual-token grid. The
+positive teacher keeps:
+
+1. every visual token intersecting the target box; and
+2. `ceil(background_token_count × background_keep_ratio)` background tokens.
+
+The default `fixed_stratified` selector distributes retained background tokens
+over the image using a deterministic Morton-order stratification. Selection is
+stable for a fixed sample ID and seed. The student continues to use the dense
+visual sequence.
+
+```text
+Original image
+  ├─ Student: all visual tokens
+  └─ Positive teacher: all target tokens + sparse global background tokens
+                         └─ token-level distillation on the student's response
+```
+
+The teacher still runs the complete image through the vision encoder. Token
+filtering is applied to the merged visual features before they enter the teacher
+LLM, together with the matching attention-mask update. Consequently, the method
+reduces the teacher LLM's effective visual sequence but should not be described
+as vision-encoder pruning.
+
+### Optional distillation-token weighting
+
+The launcher exposes three mutually exclusive modes:
+
+| Mode | Token weight | Description |
+|---|---|---|
+| `none` | `1` | Standard positive-teacher distillation. |
+| `contrastive` | `max(0, log p+(y_t) - log p-(y_t))` | A negative teacher receives an equal-size, disjoint token set sampled from the positive mask's complement. |
+| `entropy` | `exp(-β H_teacher)` | Low-entropy positive-teacher tokens receive greater weight; weights are normalized to mean 1 over the global optimizer mini-batch. |
+
+Both weighting modes operate on valid response tokens only. Their training-time
+diagnostics are documented in
+[`docs/distillation_token_weight_metrics.md`](docs/distillation_token_weight_metrics.md).
+
+### Shared visual-imagination prompt
+
+[`prompts/imagine_shared.txt`](prompts/imagine_shared.txt) is injected as a
+shared system prompt at runtime. It asks the model to identify the relevant
+region, state what becomes visually clear under closer mental inspection, and
+finish with exactly one `<answer>...</answer>`. Because the sparse teacher
+reuses the student's tokenized prompt and response, prompt and response-token
+alignment are preserved. Existing Parquet files do not need to be regenerated.
+
+## Results
+
+The current 4B experiment improves the six-benchmark average from **77.07** to
+**77.92**. The six-benchmark suite consists of V* Bench, ZoomBench, HR-Bench 4K,
+HR-Bench 8K, MME-RealWorld-EN, and MME-RealWorld-CN.
+
+| Evaluation | Vision-OPD 4B | SparseVOPD 4B | Improvement |
+|---|---:|---:|---:|
+| Six-benchmark average | 77.07 | **77.92** | **+0.85** |
+| V* Bench | 92.15 | **93.19** | **+1.04** |
+| ZoomBench | 59.76 | **62.25** | **+2.49** |
+| HR-Bench 4K | 84.50 | **86.98** | **+2.48** |
+| HR-Bench 8K | 80.38 | **81.75** | **+1.37** |
+
+All values are reported as percentage-point scores, and higher is better. The
+table lists the four benchmark-level comparisons currently reported in addition
+to the aggregate over all six evaluations.
+
+## Installation
 
 ```bash
 conda create -n vision-opd python=3.12 -y
@@ -29,142 +120,135 @@ pip install flash-attn --no-build-isolation
 pip install causal-conv1d==1.6.1 --no-build-isolation
 ```
 
-## Quick Start
-
-### 1. Deployment
-
-Serve the merged checkpoint with vLLM, for example:
-
-```bash
-vllm serve yuanqianhao/Vision-OPD-9B \
-    --gpu-memory-utilization 0.85 \
-    --tensor-parallel-size 8 \
-    --served-model-name Vision-OPD-9B \
-    --trust-remote-code
-```
-
-The server listens on port 8000 by default. You can then query the model via the OpenAI-compatible API at `http://localhost:8000/v1/chat/completions`.
-
-Please check out our [Hugging Face Collection](https://huggingface.co/collections/yuanqianhao/vision-opd) for all public Vision-OPD checkpoints.
-
-### 2. Evaluation
-
-Evaluation is split into generation and judging so the two externally hosted vLLM services do not need to share GPUs.
-First generate every benchmark answer through the model API:
-
-```bash
-EVAL_PHASE=generate \
-EXPERIMENT_NAME="vision-opd-9b-step100" \
-EVAL_DATA_ROOT="/path/to/eval-data" \
-BENCHMARKS="vstar,zoombench,hrbench-4k,hrbench-8k,mme-realworld,mme-realworld-cn" \
-GEN_PORT=8000 \
-bash eval/run_eval.sh
-```
-
-Stop the generation service, start the Judge service, and evaluate the saved experiment:
-
-```bash
-EVAL_PHASE=evaluate \
-EXPERIMENT_NAME="vision-opd-9b-step100" \
-JUDGE_PORT=8000 \
-bash eval/run_eval.sh
-```
-
-Both services use the OpenAI-compatible `/v1/models` and `/v1/chat/completions` APIs. The model ID is discovered
-automatically when the endpoint exposes exactly one model; use `GEN_MODEL_ID` or `JUDGE_MODEL_ID` to disambiguate a
-multi-model endpoint. Full remote endpoints can be supplied with `GEN_API_BASE` and `JUDGE_API_BASE` instead of ports.
-Missing datasets are downloaded under `EVAL_DATA_ROOT`. Answers, Judge results, metrics, and the resumable manifest are
-stored under `eval/results/EXPERIMENT_NAME` by default. Set `OUTPUT_ROOT` only when a different output location is needed.
-Local vLLM services do not require an API-key setting; `GEN_API_KEY` and `JUDGE_API_KEY` are optional overrides.
-See [`eval/README.md`](eval/README.md) for the complete evaluation guide.
-
-Supported benchmarks: `vstar`, `zoombench`, `hrbench-4k`, `hrbench-8k`, `mme-realworld`, `mme-realworld-cn`, `mme-realworld-lite`, `visualprobe`, `mmvp`, `cv-bench`, `mmstar`, `pope`.
-
-To evaluate Qwen3.5 models as baselines, set `ENABLE_THINKING=False` to run in non-thinking mode, for example:
-
-```bash
-EVAL_PHASE=generate \
-EXPERIMENT_NAME="qwen35-9b" \
-EVAL_DATA_ROOT="/path/to/eval-data" \
-BENCHMARKS="vstar,zoombench" \
-GEN_PORT=8000 \
-ENABLE_THINKING=False \
-bash eval/run_eval.sh
-```
-
 ## Training
 
-### 1. Prepare Training Data
+### Prepare the data
 
-Download and preprocess the [Vision-OPD-6K](https://huggingface.co/datasets/yuanqianhao/Vision-OPD-6K) dataset:
+Download and convert the
+[Vision-OPD-6K](https://huggingface.co/datasets/yuanqianhao/Vision-OPD-6K)
+training set:
 
 ```bash
 python scripts/prepare_data.py --data-dir ./data
 ```
 
-This downloads images and metadata from HuggingFace, extracts archives, and converts `train.jsonl` to the parquet format expected by the training pipeline.
+The processed dataset is written to `data/train.parquet`. Bounding boxes remain
+in image coordinates and are mapped to the model's visual-token grid during
+training.
 
-### 2. Training
+### Launch training
 
-Launch Vision-OPD training:
+The default launcher enables the same-image sparse positive teacher, keeps 10%
+of the non-target background tokens, and uses the shared visual-imagination
+prompt:
 
 ```bash
 bash scripts/run_vision_opd.sh
 ```
 
-The launcher injects `prompts/imagine_shared.txt` as a shared system prompt for both the student rollout and the
-sparse teacher. The prompt asks the model to identify a relevant region, describe image-grounded local evidence,
-and end with exactly one `<answer>...</answer>`. It is loaded at runtime, so existing Parquet files do not need to be
-regenerated. To use another prompt file or disable the shared prompt, set:
+Select a distillation-token weighting mode with an environment variable:
 
 ```bash
-SHARED_SYSTEM_PROMPT_FILE=/path/to/prompt.txt bash scripts/run_vision_opd.sh
-SHARED_SYSTEM_PROMPT_FILE= bash scripts/run_vision_opd.sh
-```
-
-The default `none` mode keeps the existing single-positive-teacher objective. Enable the equal-size positive/negative
-teacher weighting method with:
-
-```bash
+# Equal-size positive/negative sparse teachers
 DISTILLATION_TOKEN_WEIGHT_MODE=contrastive \
 CONTRASTIVE_NEGATIVE_SEED=0 \
 bash scripts/run_vision_opd.sh
-```
 
-Enable positive-teacher entropy weighting with:
-
-```bash
+# Positive-teacher entropy weighting
 DISTILLATION_TOKEN_WEIGHT_MODE=entropy \
 TEACHER_ENTROPY_BETA=1.0 \
 bash scripts/run_vision_opd.sh
 ```
 
-The two modes are mutually exclusive. `TEACHER_BACKGROUND_KEEP_RATIO` controls the positive teacher's sparse
-background ratio (default `0.1`); contrastive mode additionally supports `CONTRASTIVE_NEGATIVE_MODE` and
-`CONTRASTIVE_NEGATIVE_SEED`. Key hyperparameters can also be edited at the top of the script.
-When entropy or positive/negative teacher token weighting is enabled, the trainer reports global mini-batch weight
-distribution and supervision-quality metrics. See [`docs/distillation_token_weight_metrics.md`](docs/distillation_token_weight_metrics.md)
-for formulas and interpretation.
+Important launcher options:
 
-### 3. Merge Checkpoints
+| Variable | Default | Description |
+|---|---:|---|
+| `DISTILLATION_TOKEN_WEIGHT_MODE` | `none` | `none`, `contrastive`, or `entropy` |
+| `TEACHER_BACKGROUND_KEEP_RATIO` | `0.1` | Fraction of non-target visual tokens retained by the positive teacher |
+| `TEACHER_VISUAL_SELECTION_SEED` | `0` | Seed for deterministic stratified background selection |
+| `CONTRASTIVE_NEGATIVE_SEED` | `0` | Seed for complement-based negative masks |
+| `TEACHER_ENTROPY_BETA` | `1.0` | Entropy-weight sensitivity |
+| `SHARED_SYSTEM_PROMPT_FILE` | `prompts/imagine_shared.txt` | Shared student/teacher system prompt; set to an empty value to disable |
 
-After training, merge the FSDP-sharded checkpoint into a standard HuggingFace model:
+Additional Hydra overrides can be appended directly to the launcher command.
+Model path, batch sizes, sequence lengths, GPU count, and checkpoint locations
+can be adjusted at the top of [`scripts/run_vision_opd.sh`](scripts/run_vision_opd.sh).
+
+### Merge a checkpoint
 
 ```bash
-bash scripts/merge_checkpoint.sh <path_to_checkpoint>
+bash scripts/merge_checkpoint.sh \
+  ./checkpoints/Vision-OPD-Qwen3.5-4B/global_step_65/
 ```
 
-For example:
+The merge script exports the FSDP actor checkpoint as a standard Hugging Face
+model that can be loaded by Transformers or served with vLLM.
+
+## Evaluation
+
+The recommended evaluation entry point is the vendored, revision-pinned
+`lmms-eval` workflow under `eval_lmms/`. Generation and scoring are separate
+stages, allowing the same GPU pool to host the evaluated checkpoint first and
+the LLM Judge afterward.
+
+Prepare the evaluation environment once:
 
 ```bash
-bash scripts/merge_checkpoint.sh ./checkpoints/Vision-OPD-Qwen3.5-4B/global_step_65/
+cd third_party/lmms-eval
+uv sync
+cd ../..
+export PYTHON_BIN="$PWD/third_party/lmms-eval/.venv/bin/python"
 ```
 
-This merges the FSDP actor shards, saves the model weights, config, tokenizer, and processor into the specified directory. The merged checkpoint can then be loaded directly with `transformers` or served with vLLM.
+Generate answers from an externally hosted OpenAI-compatible vLLM server:
 
-## Citation
+```bash
+EVAL_PHASE=generate \
+EXPERIMENT_NAME=sparsevopd-4b \
+BENCHMARKS=vstar,zoombench,hrbench-4k,hrbench-8k,mme-realworld,mme-realworld-cn \
+GEN_PORT=8000 \
+bash eval_lmms/run_eval.sh
+```
 
-If you find Vision-OPD useful for your research, please consider citing:
+After generation, stop that service, start the Judge service if required, and
+replay the saved answers through the task evaluators:
+
+```bash
+EVAL_PHASE=evaluate \
+EXPERIMENT_NAME=sparsevopd-4b \
+JUDGE_PORT=8000 \
+bash eval_lmms/run_eval.sh
+```
+
+Local API keys default to `EMPTY`. Data is stored under `eval_lmms/data`, while
+isolated experiment outputs are written to
+`eval_lmms/results/<EXPERIMENT_NAME>`. See
+[`eval_lmms/README.md`](eval_lmms/README.md) for remote endpoints, Judge
+requirements, resumability, task aliases, output structure, and the native
+lmms-eval Log Viewer. The original project-specific evaluation implementation
+is retained under `eval/` for compatibility.
+
+## Serving
+
+Serve a merged checkpoint through vLLM:
+
+```bash
+vllm serve /path/to/merged-checkpoint \
+  --served-model-name SparseVOPD-4B \
+  --tensor-parallel-size 8 \
+  --gpu-memory-utilization 0.85 \
+  --trust-remote-code
+```
+
+## Acknowledgements and Citation
+
+SparseVOPD is derived from the official
+[Vision-OPD](https://github.com/VisionOPD/Vision-OPD) implementation. We thank
+the Vision-OPD authors and the open-source `verl` and `lmms-eval` communities.
+
+If this repository is useful in your work, please cite the original Vision-OPD
+paper:
 
 ```bibtex
 @article{yuan2026vision,
@@ -177,4 +261,4 @@ If you find Vision-OPD useful for your research, please consider citing:
 
 ## License
 
-Apache-2.0 License
+This project is released under the Apache License 2.0. See [LICENSE](LICENSE).
